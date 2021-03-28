@@ -8,3 +8,4 @@ edition = "2018"
 
 [dependencies]
 serialport = "4.0.0"
+rocket = "0.4.5"
