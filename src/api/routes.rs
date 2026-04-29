@@ -4,7 +4,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::serial::manager::{
     list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
@@ -39,6 +39,11 @@ struct DisconnectResponse {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DisconnectRequest {
+    name: String,
+}
+
 #[derive(Clone)]
 pub struct AppState<L, C> {
     port_lister: L,
@@ -70,11 +75,15 @@ where
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/ports", get(ports::<L, C>))
+        .route("/list", get(ports::<L, C>))
         .route(
             "/api/v1/connections",
             post(connect::<L, C>).get(connections::<L, C>),
         )
         .route("/api/v1/connections/:name", delete(disconnect::<L, C>))
+        .route("/connect", post(connect::<L, C>))
+        .route("/info", get(connections::<L, C>))
+        .route("/disconnect", post(disconnect_alias::<L, C>))
         .with_state(state)
 }
 
@@ -140,6 +149,25 @@ where
     let name = state
         .connection_manager
         .disconnect(&name)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(DisconnectResponse {
+        status: "disconnected",
+        name,
+    }))
+}
+
+async fn disconnect_alias<L, C>(
+    State(state): State<AppState<L, C>>,
+    Json(request): Json<DisconnectRequest>,
+) -> Result<Json<DisconnectResponse>, StatusCode>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    let name = state
+        .connection_manager
+        .disconnect(&request.name)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(DisconnectResponse {
@@ -322,5 +350,142 @@ mod tests {
             delete_payload,
             json!({"status":"disconnected","name":"default"})
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_alias_routes_share_connection_state() {
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister {
+                ports: vec![PortInfo {
+                    name: "/dev/ttyUSB0".to_string(),
+                    port_type: "usb".to_string(),
+                    manufacturer: Some("FTDI".to_string()),
+                    serial_number: Some("ABC123".to_string()),
+                }],
+            },
+            connection_manager: InMemoryConnectionManager::default(),
+        });
+
+        let list_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/list").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_payload: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(
+            list_payload,
+            json!({
+                "ports": [
+                    {
+                        "name": "/dev/ttyUSB0",
+                        "type": "usb",
+                        "manufacturer": "FTDI",
+                        "serial_number": "ABC123"
+                    }
+                ]
+            })
+        );
+
+        let connect_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connect")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/ttyUSB0","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(connect_response.status(), StatusCode::OK);
+        let connect_body = to_bytes(connect_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let connect_payload: serde_json::Value = serde_json::from_slice(&connect_body).unwrap();
+        assert_eq!(
+            connect_payload,
+            json!({
+                "status": "connected",
+                "connection": {
+                    "name": "default",
+                    "status": "connected",
+                    "port": "/dev/ttyUSB0",
+                    "baudRate": 115200,
+                    "delimiter": "\r\n"
+                }
+            })
+        );
+
+        let info_response = app
+            .clone()
+            .oneshot(Request::builder().uri("/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(info_response.status(), StatusCode::OK);
+        let info_body = to_bytes(info_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let info_payload: serde_json::Value = serde_json::from_slice(&info_body).unwrap();
+        assert_eq!(
+            info_payload,
+            json!({
+                "connections": [
+                    {
+                        "name": "default",
+                        "status": "connected",
+                        "port": "/dev/ttyUSB0",
+                        "baudRate": 115200,
+                        "delimiter": "\r\n"
+                    }
+                ]
+            })
+        );
+
+        let disconnect_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/disconnect")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"default"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(disconnect_response.status(), StatusCode::OK);
+        let disconnect_body = to_bytes(disconnect_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let disconnect_payload: serde_json::Value =
+            serde_json::from_slice(&disconnect_body).unwrap();
+        assert_eq!(
+            disconnect_payload,
+            json!({"status":"disconnected","name":"default"})
+        );
+
+        let final_info_response = app
+            .oneshot(Request::builder().uri("/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(final_info_response.status(), StatusCode::OK);
+        let final_info_body = to_bytes(final_info_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let final_info_payload: serde_json::Value =
+            serde_json::from_slice(&final_info_body).unwrap();
+        assert_eq!(final_info_payload, json!({"connections": []}));
     }
 }
