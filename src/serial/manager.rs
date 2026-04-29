@@ -1,4 +1,7 @@
-use serde::Serialize;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
 use serialport::{SerialPortInfo, SerialPortType};
 
 use crate::error::Result;
@@ -14,6 +17,74 @@ pub struct PortInfo {
 
 #[derive(Clone, Debug, Default)]
 pub struct SystemPortLister;
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConnectionRequest {
+    pub name: String,
+    pub port: String,
+    #[serde(rename = "baudRate")]
+    pub baud_rate: u32,
+    pub delimiter: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConnectionInfo {
+    pub name: String,
+    pub status: &'static str,
+    pub port: String,
+    #[serde(rename = "baudRate")]
+    pub baud_rate: u32,
+    pub delimiter: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InMemoryConnectionManager {
+    connections: Arc<Mutex<BTreeMap<String, ConnectionInfo>>>,
+}
+
+pub trait ConnectionManager: Clone + Send + Sync + 'static {
+    fn connect(&self, request: ConnectionRequest) -> Result<ConnectionInfo>;
+    fn connections(&self) -> Result<Vec<ConnectionInfo>>;
+    fn disconnect(&self, name: &str) -> Result<String>;
+}
+
+impl ConnectionManager for InMemoryConnectionManager {
+    fn connect(&self, request: ConnectionRequest) -> Result<ConnectionInfo> {
+        let connection = ConnectionInfo {
+            name: request.name,
+            status: "connected",
+            port: request.port,
+            baud_rate: request.baud_rate,
+            delimiter: request.delimiter,
+        };
+
+        self.connections
+            .lock()
+            .expect("in-memory connection registry lock poisoned")
+            .insert(connection.name.clone(), connection.clone());
+
+        Ok(connection)
+    }
+
+    fn connections(&self) -> Result<Vec<ConnectionInfo>> {
+        Ok(self
+            .connections
+            .lock()
+            .expect("in-memory connection registry lock poisoned")
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    fn disconnect(&self, name: &str) -> Result<String> {
+        self.connections
+            .lock()
+            .expect("in-memory connection registry lock poisoned")
+            .remove(name);
+
+        Ok(name.to_string())
+    }
+}
 
 pub trait SerialPortLister: Clone + Send + Sync + 'static {
     fn available_ports(&self) -> Result<Vec<PortInfo>>;
@@ -95,5 +166,42 @@ mod tests {
                 serial_number: Some("ABC123".to_string()),
             }]
         );
+    }
+
+    #[test]
+    fn in_memory_connection_manager_records_connections() {
+        let manager = InMemoryConnectionManager::default();
+
+        let connection = manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(connection.name, "default");
+        assert_eq!(connection.status, "connected");
+        assert_eq!(manager.connections().unwrap(), vec![connection]);
+    }
+
+    #[test]
+    fn in_memory_connection_manager_removes_disconnected_connections() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+
+        let disconnected_name = manager.disconnect("default").unwrap();
+
+        assert_eq!(disconnected_name, "default");
+        assert_eq!(manager.connections().unwrap(), Vec::<ConnectionInfo>::new());
     }
 }

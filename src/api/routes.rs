@@ -1,7 +1,15 @@
-use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{delete, get, post},
+    Json, Router,
+};
 use serde::Serialize;
 
-use crate::serial::manager::{list_ports, PortInfo, SerialPortLister, SystemPortLister};
+use crate::serial::manager::{
+    list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
+    PortInfo, SerialPortLister, SystemPortLister,
+};
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -14,18 +22,60 @@ struct PortsResponse {
     ports: Vec<PortInfo>,
 }
 
+#[derive(Debug, Serialize)]
+struct ConnectResponse {
+    status: &'static str,
+    connection: ConnectionInfo,
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectionsResponse {
+    connections: Vec<ConnectionInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct DisconnectResponse {
+    status: &'static str,
+    name: String,
+}
+
+#[derive(Clone)]
+pub struct AppState<L, C> {
+    port_lister: L,
+    connection_manager: C,
+}
+
 pub fn router() -> Router {
-    router_with_port_lister(SystemPortLister)
+    router_with_state(AppState {
+        port_lister: SystemPortLister,
+        connection_manager: InMemoryConnectionManager::default(),
+    })
 }
 
 pub fn router_with_port_lister<L>(port_lister: L) -> Router
 where
     L: SerialPortLister,
 {
+    router_with_state(AppState {
+        port_lister,
+        connection_manager: InMemoryConnectionManager::default(),
+    })
+}
+
+pub fn router_with_state<L, C>(state: AppState<L, C>) -> Router
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
     Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/ports", get(ports::<L>))
-        .with_state(port_lister)
+        .route("/api/v1/ports", get(ports::<L, C>))
+        .route(
+            "/api/v1/connections",
+            post(connect::<L, C>).get(connections::<L, C>),
+        )
+        .route("/api/v1/connections/:name", delete(disconnect::<L, C>))
+        .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -35,13 +85,67 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn ports<L>(State(port_lister): State<L>) -> Result<Json<PortsResponse>, StatusCode>
+async fn ports<L, C>(State(state): State<AppState<L, C>>) -> Result<Json<PortsResponse>, StatusCode>
 where
     L: SerialPortLister,
+    C: ConnectionManager,
 {
-    let ports = list_ports(&port_lister).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let ports = list_ports(&state.port_lister).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(PortsResponse { ports }))
+}
+
+async fn connect<L, C>(
+    State(state): State<AppState<L, C>>,
+    Json(request): Json<ConnectionRequest>,
+) -> Result<Json<ConnectResponse>, StatusCode>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    let connection = state
+        .connection_manager
+        .connect(request)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ConnectResponse {
+        status: "connected",
+        connection,
+    }))
+}
+
+async fn connections<L, C>(
+    State(state): State<AppState<L, C>>,
+) -> Result<Json<ConnectionsResponse>, StatusCode>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    let connections = state
+        .connection_manager
+        .connections()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ConnectionsResponse { connections }))
+}
+
+async fn disconnect<L, C>(
+    State(state): State<AppState<L, C>>,
+    Path(name): Path<String>,
+) -> Result<Json<DisconnectResponse>, StatusCode>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    let name = state
+        .connection_manager
+        .disconnect(&name)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(DisconnectResponse {
+        status: "disconnected",
+        name,
+    }))
 }
 
 #[cfg(test)]
@@ -54,7 +158,7 @@ mod tests {
 
     use super::*;
     use crate::error::Result;
-    use crate::serial::manager::{PortInfo, SerialPortLister};
+    use crate::serial::manager::{InMemoryConnectionManager, PortInfo, SerialPortLister};
 
     #[derive(Clone)]
     struct MockPortLister {
@@ -123,6 +227,100 @@ mod tests {
                     }
                 ]
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_lifecycle_routes_manage_mock_connections() {
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: InMemoryConnectionManager::default(),
+        });
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/ttyUSB0","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let create_payload: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(
+            create_payload,
+            json!({
+                "status": "connected",
+                "connection": {
+                    "name": "default",
+                    "status": "connected",
+                    "port": "/dev/ttyUSB0",
+                    "baudRate": 115200,
+                    "delimiter": "\r\n"
+                }
+            })
+        );
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/connections")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_payload: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+        assert_eq!(
+            list_payload,
+            json!({
+                "connections": [
+                    {
+                        "name": "default",
+                        "status": "connected",
+                        "port": "/dev/ttyUSB0",
+                        "baudRate": 115200,
+                        "delimiter": "\r\n"
+                    }
+                ]
+            })
+        );
+
+        let delete_response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/connections/default")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        let delete_body = to_bytes(delete_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let delete_payload: serde_json::Value = serde_json::from_slice(&delete_body).unwrap();
+        assert_eq!(
+            delete_payload,
+            json!({"status":"disconnected","name":"default"})
         );
     }
 }
