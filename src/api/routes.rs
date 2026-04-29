@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::serial::manager::{
     list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
@@ -44,6 +45,22 @@ struct DisconnectRequest {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CommandRequest {
+    payload: Value,
+    #[serde(rename = "waitForResponse", default)]
+    _wait_for_response: bool,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandResponse {
+    status: &'static str,
+    #[serde(rename = "reqId")]
+    req_id: String,
+}
+
 #[derive(Clone)]
 pub struct AppState<L, C> {
     port_lister: L,
@@ -80,8 +97,13 @@ where
             "/api/v1/connections",
             post(connect::<L, C>).get(connections::<L, C>),
         )
+        .route(
+            "/api/v1/connections/:name/commands",
+            post(send_command::<L, C>),
+        )
         .route("/api/v1/connections/:name", delete(disconnect::<L, C>))
         .route("/connect", post(connect::<L, C>))
+        .route("/commit", post(commit_alias::<L, C>))
         .route("/info", get(connections::<L, C>))
         .route("/disconnect", post(disconnect_alias::<L, C>))
         .with_state(state)
@@ -138,6 +160,31 @@ where
     Ok(Json(ConnectionsResponse { connections }))
 }
 
+async fn send_command<L, C>(
+    State(state): State<AppState<L, C>>,
+    Path(name): Path<String>,
+    Json(request): Json<CommandRequest>,
+) -> Result<Json<CommandResponse>, StatusCode>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    let CommandRequest {
+        payload,
+        _wait_for_response: _,
+        _timeout_ms: _,
+    } = request;
+    let queued = state
+        .connection_manager
+        .send_command(&name, payload)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(CommandResponse {
+        status: "queued",
+        req_id: queued.req_id,
+    }))
+}
+
 async fn disconnect<L, C>(
     State(state): State<AppState<L, C>>,
     Path(name): Path<String>,
@@ -173,6 +220,25 @@ where
     Ok(Json(DisconnectResponse {
         status: "disconnected",
         name,
+    }))
+}
+
+async fn commit_alias<L, C>(
+    State(state): State<AppState<L, C>>,
+    Json(payload): Json<Value>,
+) -> Result<Json<CommandResponse>, StatusCode>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    let queued = state
+        .connection_manager
+        .send_command("default", payload)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(CommandResponse {
+        status: "queued",
+        req_id: queued.req_id,
     }))
 }
 
@@ -349,6 +415,101 @@ mod tests {
         assert_eq!(
             delete_payload,
             json!({"status":"disconnected","name":"default"})
+        );
+    }
+
+    #[tokio::test]
+    async fn command_route_queues_payload_for_named_connection() {
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: InMemoryConnectionManager::default(),
+        });
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/ttyUSB0","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let command_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections/default/commands")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"payload":{"method":"query","topic":"sensor.read","data":{}},"waitForResponse":false,"timeoutMs":2000}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(command_response.status(), StatusCode::OK);
+        let command_body = to_bytes(command_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let command_payload: serde_json::Value = serde_json::from_slice(&command_body).unwrap();
+        assert_eq!(command_payload, json!({"status":"queued","reqId":"1"}));
+    }
+
+    #[tokio::test]
+    async fn commit_alias_queues_payload_for_default_connection() {
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: InMemoryConnectionManager::default(),
+        });
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connect")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/ttyUSB0","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let commit_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/commit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"reqId":"client-42","method":"mutation","topic":"led.set","data":{"on":true}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(commit_response.status(), StatusCode::OK);
+        let commit_body = to_bytes(commit_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let commit_payload: serde_json::Value = serde_json::from_slice(&commit_body).unwrap();
+        assert_eq!(
+            commit_payload,
+            json!({"status":"queued","reqId":"client-42"})
         );
     }
 

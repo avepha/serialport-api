@@ -11,6 +11,12 @@ pub enum SerialportApiError {
     #[error("serial port error: {0}")]
     SerialPort(#[from] serialport::Error),
 
+    #[error("connection not found: {0}")]
+    ConnectionNotFound(String),
+
+    #[error("command payload must be a JSON object")]
+    InvalidCommandPayload,
+
     #[error("command timed out")]
     CommandTimeout,
 }

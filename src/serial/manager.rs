@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use serialport::{SerialPortInfo, SerialPortType};
 
-use crate::error::Result;
+use crate::error::{Result, SerialportApiError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PortInfo {
@@ -37,15 +38,36 @@ pub struct ConnectionInfo {
     pub delimiter: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueuedCommand {
+    #[serde(rename = "reqId")]
+    pub req_id: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryConnectionManager {
     connections: Arc<Mutex<BTreeMap<String, ConnectionInfo>>>,
+    next_req_id: Arc<Mutex<u64>>,
+    written_frames: Arc<Mutex<BTreeMap<String, Vec<Vec<u8>>>>>,
 }
 
 pub trait ConnectionManager: Clone + Send + Sync + 'static {
     fn connect(&self, request: ConnectionRequest) -> Result<ConnectionInfo>;
     fn connections(&self) -> Result<Vec<ConnectionInfo>>;
     fn disconnect(&self, name: &str) -> Result<String>;
+    fn send_command(&self, connection_name: &str, payload: Value) -> Result<QueuedCommand>;
+}
+
+impl InMemoryConnectionManager {
+    #[cfg(test)]
+    pub fn written_frames(&self, name: &str) -> Vec<Vec<u8>> {
+        self.written_frames
+            .lock()
+            .expect("in-memory written frames lock poisoned")
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 impl ConnectionManager for InMemoryConnectionManager {
@@ -83,6 +105,44 @@ impl ConnectionManager for InMemoryConnectionManager {
             .remove(name);
 
         Ok(name.to_string())
+    }
+
+    fn send_command(&self, connection_name: &str, mut payload: Value) -> Result<QueuedCommand> {
+        let connection = self
+            .connections
+            .lock()
+            .expect("in-memory connection registry lock poisoned")
+            .get(connection_name)
+            .cloned()
+            .ok_or_else(|| SerialportApiError::ConnectionNotFound(connection_name.to_string()))?;
+
+        let object = payload
+            .as_object_mut()
+            .ok_or(SerialportApiError::InvalidCommandPayload)?;
+
+        let req_id = match object.get("reqId").and_then(Value::as_str) {
+            Some(req_id) => req_id.to_string(),
+            None => {
+                let mut next_req_id = self
+                    .next_req_id
+                    .lock()
+                    .expect("in-memory request id counter lock poisoned");
+                *next_req_id += 1;
+                let req_id = next_req_id.to_string();
+                object.insert("reqId".to_string(), Value::String(req_id.clone()));
+                req_id
+            }
+        };
+
+        let frame = crate::protocol::frame_json(&payload, &connection.delimiter)?;
+        self.written_frames
+            .lock()
+            .expect("in-memory written frames lock poisoned")
+            .entry(connection_name.to_string())
+            .or_default()
+            .push(frame);
+
+        Ok(QueuedCommand { req_id })
     }
 }
 
@@ -203,5 +263,88 @@ mod tests {
 
         assert_eq!(disconnected_name, "default");
         assert_eq!(manager.connections().unwrap(), Vec::<ConnectionInfo>::new());
+    }
+
+    #[test]
+    fn in_memory_connection_manager_records_framed_command_with_generated_req_id() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+
+        let queued = manager
+            .send_command(
+                "default",
+                serde_json::json!({
+                    "method": "query",
+                    "topic": "sensor.read",
+                    "data": {}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(queued.req_id, "1");
+        let frames = manager.written_frames("default");
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].ends_with(b"\r\n"));
+        let body = &frames[0][..frames[0].len() - 2];
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "reqId": "1",
+                "method": "query",
+                "topic": "sensor.read",
+                "data": {}
+            })
+        );
+    }
+
+    #[test]
+    fn in_memory_connection_manager_preserves_existing_req_id() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115200,
+                delimiter: "\n".to_string(),
+            })
+            .unwrap();
+
+        let queued = manager
+            .send_command(
+                "default",
+                serde_json::json!({
+                    "reqId": "client-42",
+                    "method": "mutation",
+                    "topic": "led.set",
+                    "data": {"on": true}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(queued.req_id, "client-42");
+        let frames = manager.written_frames("default");
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].ends_with(b"\n"));
+        let body = &frames[0][..frames[0].len() - 1];
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "reqId": "client-42",
+                "method": "mutation",
+                "topic": "led.set",
+                "data": {"on": true}
+            })
+        );
     }
 }
