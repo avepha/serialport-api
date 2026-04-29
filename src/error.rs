@@ -8,6 +8,9 @@ pub enum SerialportApiError {
     #[error("invalid UTF-8 serial line")]
     InvalidUtf8,
 
+    #[error("serial port error: {0}")]
+    SerialPort(#[from] serialport::Error),
+
     #[error("command timed out")]
     CommandTimeout,
 }

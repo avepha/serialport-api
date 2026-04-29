@@ -6,3 +6,4 @@
 pub mod api;
 pub mod error;
 pub mod protocol;
+pub mod serial;
