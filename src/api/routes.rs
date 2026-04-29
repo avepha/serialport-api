@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::sse::{Event, Sse},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -91,6 +92,7 @@ where
 {
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/events", get(events::<L, C>))
         .route("/api/v1/ports", get(ports::<L, C>))
         .route("/list", get(ports::<L, C>))
         .route(
@@ -124,6 +126,30 @@ where
     let ports = list_ports(&state.port_lister).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(PortsResponse { ports }))
+}
+
+async fn events<L, C>(
+    State(state): State<AppState<L, C>>,
+) -> Result<
+    Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, axum::Error>>>,
+    StatusCode,
+>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    let events = state
+        .connection_manager
+        .events()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let stream = tokio_stream::iter(events.into_iter().map(|serial_event| {
+        Event::default()
+            .event(serial_event.event)
+            .json_data(serial_event.data)
+    }));
+
+    Ok(Sse::new(stream))
 }
 
 async fn connect<L, C>(
@@ -511,6 +537,48 @@ mod tests {
             commit_payload,
             json!({"status":"queued","reqId":"client-42"})
         );
+    }
+
+    #[tokio::test]
+    async fn events_route_streams_recorded_serial_events_as_sse() {
+        let manager = InMemoryConnectionManager::default();
+        manager.record_event(crate::protocol::SerialEvent::Json(json!({
+            "reqId": "1",
+            "ok": true
+        })));
+        manager.record_event(crate::protocol::SerialEvent::Text(
+            "hello robot".to_string(),
+        ));
+
+        let response = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: manager,
+        })
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+
+        assert!(body.contains("event: serial.json"));
+        assert!(body.contains("data: {\"ok\":true,\"reqId\":\"1\"}"));
+        assert!(body.contains("event: serial.text"));
+        assert!(body.contains("data: \"hello robot\""));
     }
 
     #[tokio::test]

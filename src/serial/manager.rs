@@ -44,11 +44,18 @@ pub struct QueuedCommand {
     pub req_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SerialStreamEvent {
+    pub event: &'static str,
+    pub data: Value,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryConnectionManager {
     connections: Arc<Mutex<BTreeMap<String, ConnectionInfo>>>,
     next_req_id: Arc<Mutex<u64>>,
     written_frames: Arc<Mutex<BTreeMap<String, Vec<Vec<u8>>>>>,
+    events: Arc<Mutex<Vec<SerialStreamEvent>>>,
 }
 
 pub trait ConnectionManager: Clone + Send + Sync + 'static {
@@ -56,6 +63,7 @@ pub trait ConnectionManager: Clone + Send + Sync + 'static {
     fn connections(&self) -> Result<Vec<ConnectionInfo>>;
     fn disconnect(&self, name: &str) -> Result<String>;
     fn send_command(&self, connection_name: &str, payload: Value) -> Result<QueuedCommand>;
+    fn events(&self) -> Result<Vec<SerialStreamEvent>>;
 }
 
 impl InMemoryConnectionManager {
@@ -67,6 +75,47 @@ impl InMemoryConnectionManager {
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub fn record_event(&self, event: crate::protocol::SerialEvent) {
+        let event = SerialStreamEvent::from(event);
+        self.events
+            .lock()
+            .expect("in-memory serial events lock poisoned")
+            .push(event);
+    }
+
+    pub fn record_error(&self, message: impl Into<String>) {
+        self.events
+            .lock()
+            .expect("in-memory serial events lock poisoned")
+            .push(SerialStreamEvent {
+                event: "serial.error",
+                data: Value::String(message.into()),
+            });
+    }
+}
+
+impl From<crate::protocol::SerialEvent> for SerialStreamEvent {
+    fn from(event: crate::protocol::SerialEvent) -> Self {
+        match event {
+            crate::protocol::SerialEvent::Json(data) => Self {
+                event: "serial.json",
+                data,
+            },
+            crate::protocol::SerialEvent::Text(text) => Self {
+                event: "serial.text",
+                data: Value::String(text),
+            },
+            crate::protocol::SerialEvent::Log(data) => Self {
+                event: "serial.log",
+                data,
+            },
+            crate::protocol::SerialEvent::Notification(data) => Self {
+                event: "serial.notification",
+                data,
+            },
+        }
     }
 }
 
@@ -143,6 +192,14 @@ impl ConnectionManager for InMemoryConnectionManager {
             .push(frame);
 
         Ok(QueuedCommand { req_id })
+    }
+
+    fn events(&self) -> Result<Vec<SerialStreamEvent>> {
+        Ok(self
+            .events
+            .lock()
+            .expect("in-memory serial events lock poisoned")
+            .clone())
     }
 }
 
@@ -345,6 +402,56 @@ mod tests {
                 "topic": "led.set",
                 "data": {"on": true}
             })
+        );
+    }
+
+    #[test]
+    fn in_memory_connection_manager_records_serial_events_for_streaming() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager.record_event(crate::protocol::SerialEvent::Json(serde_json::json!({
+            "reqId": "1",
+            "ok": true
+        })));
+        manager.record_event(crate::protocol::SerialEvent::Text(
+            "hello robot".to_string(),
+        ));
+        manager.record_event(crate::protocol::SerialEvent::Log(serde_json::json!({
+            "method": "log",
+            "data": {"level": "info"}
+        })));
+        manager.record_event(crate::protocol::SerialEvent::Notification(
+            serde_json::json!({
+                "method": "notification",
+                "data": []
+            }),
+        ));
+        manager.record_error("serial read failed");
+
+        assert_eq!(
+            manager.events().unwrap(),
+            vec![
+                SerialStreamEvent {
+                    event: "serial.json",
+                    data: serde_json::json!({"reqId":"1","ok":true}),
+                },
+                SerialStreamEvent {
+                    event: "serial.text",
+                    data: serde_json::json!("hello robot"),
+                },
+                SerialStreamEvent {
+                    event: "serial.log",
+                    data: serde_json::json!({"method":"log","data":{"level":"info"}}),
+                },
+                SerialStreamEvent {
+                    event: "serial.notification",
+                    data: serde_json::json!({"method":"notification","data":[]}),
+                },
+                SerialStreamEvent {
+                    event: "serial.error",
+                    data: serde_json::json!("serial read failed"),
+                },
+            ]
         );
     }
 }
