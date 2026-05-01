@@ -1,0 +1,13 @@
+[server]
+host = "0.0.0.0"
+port = 4002
+
+[serial]
+default_port = "/dev/serial/by-id/usb-EXAMPLE"
+default_baud_rate = 115200
+default_delimiter = "\r\n"
+real_serial = true
+mock_device = false
+
+[storage]
+preset_db = "/var/lib/serialport-api/presets.db"

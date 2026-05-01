@@ -4,7 +4,7 @@
 
 ## Status
 
-> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. Optional TOML config defaults and opt-in `--real-serial` mode are available. Preset storage and Raspberry Pi packaging are planned but not complete yet.
+> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. Optional TOML config defaults, opt-in `--real-serial` mode, and saved command presets with opt-in SQLite persistence are available. Raspberry Pi/systemd deployment docs and examples are available; release packaging is planned for a later phase.
 
 Use the current default server to exercise the HTTP API shape, route compatibility, request/response JSON, command framing, and event-stream formatting without hardware. Use `serve --real-serial` only when you intentionally want to open and communicate with attached serial devices.
 
@@ -25,14 +25,15 @@ Implemented now:
 - [x] Opt-in mock-device/scripted responses for hardware-free response tests
 - [x] Opt-in real serial mode for opening/writing/reading OS serial ports
 - [x] Coordinated real serial read-loop lifecycle with hardware-free tests
-- [x] Optional TOML config file defaults for server and serial startup settings
+- [x] Optional TOML config file defaults for server, serial, and storage settings
+- [x] Saved command preset CRUD routes under `/api/v1/presets`
+- [x] Opt-in SQLite preset persistence with `--preset-db` or `[storage] preset_db`
+- [x] Raspberry Pi install guide and systemd service examples
 - [x] GitHub Actions CI for format, clippy, and tests
 - [x] Unit and route tests for current behavior
 
 Planned / not complete yet:
 
-- [ ] SQLite saved presets
-- [ ] Raspberry Pi install guide and systemd service
 - [ ] Release binaries / Docker image
 - [ ] WebSocket or Socket.IO support
 
@@ -63,6 +64,12 @@ Start the Axum HTTP server:
 
 ```bash
 cargo run -- serve --host 127.0.0.1 --port 4002
+```
+
+To use SQLite-backed saved command presets instead of the default in-memory preset store, pass a database path:
+
+```bash
+cargo run -- serve --host 127.0.0.1 --port 4002 --preset-db ./presets.db
 ```
 
 Port `4002` is the default compatibility port from the older JavaScript `sg-mcu-com` workflow.
@@ -103,14 +110,17 @@ default_delimiter = "\r\n"
 real_serial = false
 mock_device = false
 mock_script = "./mock-responses.json"
+
+[storage]
+preset_db = "./presets.db"
 ```
 
 Precedence is:
 
-1. Explicit CLI flags such as `--host`, `--port`, `--mock-device`, `--mock-script`, and `--real-serial`
+1. Explicit CLI flags such as `--host`, `--port`, `--mock-device`, `--mock-script`, `--real-serial`, and `--preset-db`
 2. Environment variables `SERIALPORT_API_HOST` and `SERIALPORT_API_PORT`
 3. Config-file values
-4. Built-in defaults (`127.0.0.1:4002`, mock/in-memory mode, baud `115200`, delimiter `\r\n`)
+4. Built-in defaults (`127.0.0.1:4002`, mock/in-memory mode, in-memory presets, baud `115200`, delimiter `\r\n`)
 
 `mock_script` implies mock-device behavior. The server rejects a resolved configuration that combines real serial mode with mock-device or mock-script mode.
 
@@ -314,6 +324,34 @@ Current event names:
 
 Important current limitation: the server starts with no pre-seeded events, so a manual `curl` against a fresh server may show SSE headers with no event body. Route tests seed mock events and verify SSE formatting.
 
+## Saved command presets
+
+Preset routes store reusable JSON command payloads without opening serial ports or sending commands. By default, presets are in-memory and reset when the server exits. Use `--preset-db <PATH>` or `[storage] preset_db = "..."` to enable SQLite persistence.
+
+Create a preset:
+
+```bash
+curl -s -X POST http://127.0.0.1:4002/api/v1/presets \
+  -H 'content-type: application/json' \
+  -d '{"name":"Read IMU","payload":{"method":"query","topic":"imu.read","data":{}}}'
+```
+
+List presets:
+
+```bash
+curl -s http://127.0.0.1:4002/api/v1/presets
+```
+
+Other preset routes:
+
+- `GET /api/v1/presets/:id` returns one preset.
+- `PUT /api/v1/presets/:id` updates a preset with a new `name` and JSON-object `payload`.
+- `DELETE /api/v1/presets/:id` deletes a preset.
+
+## Raspberry Pi / systemd deployment
+
+For Raspberry Pi OS and Debian-like Linux deployments, see [`docs/raspberry-pi-systemd.md`](docs/raspberry-pi-systemd.md). The guide covers building or copying the binary, serial permissions, `/dev/serial/by-id/*` device paths, example TOML config with `[storage] preset_db`, a systemd unit, smoke checks, troubleshooting, and network exposure notes.
+
 ## Legacy compatibility aliases
 
 These routes ease migration from the older JavaScript `sg-mcu-com` workflow while the Rust API settles.
@@ -443,13 +481,10 @@ Important source files:
 
 Near-term work:
 
-- Add persistent saved connection profiles/presets.
+- Add release binaries and/or a Docker image.
 
 Later work:
 
-- SQLite-backed saved presets.
-- Raspberry Pi install docs and systemd unit examples.
-- Release binaries and/or Docker image.
 - WebSocket or Socket.IO compatibility if needed for browser clients.
 
 ## License

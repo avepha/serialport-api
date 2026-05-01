@@ -1,0 +1,23 @@
+[Unit]
+Description=serialport-api JSON serial HTTP service
+Documentation=https://github.com/avepha/serialport-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=serialport-api
+Group=serialport-api
+SupplementaryGroups=dialout
+WorkingDirectory=/var/lib/serialport-api
+ExecStart=/usr/local/bin/serialport-api serve --config /etc/serialport-api/serialport-api.toml
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/serialport-api
+
+[Install]
+WantedBy=multi-user.target
