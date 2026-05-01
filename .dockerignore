@@ -1,0 +1,15 @@
+.git
+.gitignore
+target
+Dockerfile
+.dockerignore
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.env
+.idea
+.vscode
+.DS_Store
+*.swp
+*.swo

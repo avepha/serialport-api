@@ -1,0 +1,20 @@
+services:
+  serialport-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: serialport-api:local
+    ports:
+      - "4002:4002"
+    command: ["serve", "--host", "0.0.0.0", "--port", "4002"]
+    # For config + SQLite persistence, create a config that uses /data/presets.db:
+    # volumes:
+    #   - ./serialport-api.toml:/config/serialport-api.toml:ro
+    #   - serialport-api-data:/data
+    # command: ["serve", "--config", "/config/serialport-api.toml"]
+    # For real serial on native Linux, also add a device mapping, for example:
+    # devices:
+    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
+
+# volumes:
+#   serialport-api-data:

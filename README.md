@@ -4,7 +4,7 @@
 
 ## Status
 
-> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. Optional TOML config defaults, opt-in `--real-serial` mode, and saved command presets with opt-in SQLite persistence are available. Raspberry Pi/systemd deployment docs and examples are available; release packaging is planned for a later phase.
+> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. Optional TOML config defaults, opt-in `--real-serial` mode, and saved command presets with opt-in SQLite persistence are available. Raspberry Pi/systemd deployment docs, Docker runtime packaging, and tag-triggered release automation are available.
 
 Use the current default server to exercise the HTTP API shape, route compatibility, request/response JSON, command framing, and event-stream formatting without hardware. Use `serve --real-serial` only when you intentionally want to open and communicate with attached serial devices.
 
@@ -29,13 +29,15 @@ Implemented now:
 - [x] Saved command preset CRUD routes under `/api/v1/presets`
 - [x] Opt-in SQLite preset persistence with `--preset-db` or `[storage] preset_db`
 - [x] Raspberry Pi install guide and systemd service examples
+- [x] Dockerfile and Docker Compose example for local/container runs
+- [x] Tag-triggered GitHub release workflow for Linux binary and GHCR image publishing
 - [x] GitHub Actions CI for format, clippy, and tests
 - [x] Unit and route tests for current behavior
 
 Planned / not complete yet:
 
-- [ ] Release binaries / Docker image
 - [ ] WebSocket or Socket.IO support
+- [ ] ARM/Raspberry Pi release binary automation
 
 ## Install / build
 
@@ -57,6 +59,23 @@ For local development inside an existing checkout:
 ```bash
 cargo build
 ```
+
+## Docker quick start
+
+Build and run the container without installing a local Rust toolchain:
+
+```bash
+docker build -t serialport-api:local .
+docker run --rm -p 4002:4002 serialport-api:local
+```
+
+Then check the mock-mode API from another terminal:
+
+```bash
+curl -s http://127.0.0.1:4002/api/v1/health
+```
+
+The default container command starts `serve --host 0.0.0.0 --port 4002` in mock/in-memory mode. For config mounts, SQLite preset volumes, Linux serial-device pass-through, Docker Compose, and tag-triggered release workflow details, see [`docs/docker-release.md`](docs/docker-release.md).
 
 ## Run the server
 
@@ -348,6 +367,10 @@ Other preset routes:
 - `PUT /api/v1/presets/:id` updates a preset with a new `name` and JSON-object `payload`.
 - `DELETE /api/v1/presets/:id` deletes a preset.
 
+## Docker / release packaging
+
+For Docker-based local runs and release packaging, see [`docs/docker-release.md`](docs/docker-release.md). The repository includes a root `Dockerfile`, an optional [`examples/docker-compose.yml`](examples/docker-compose.yml), and a tag-triggered GitHub Actions release workflow for Linux x86_64 binary archives and GHCR image publishing.
+
 ## Raspberry Pi / systemd deployment
 
 For Raspberry Pi OS and Debian-like Linux deployments, see [`docs/raspberry-pi-systemd.md`](docs/raspberry-pi-systemd.md). The guide covers building or copying the binary, serial permissions, `/dev/serial/by-id/*` device paths, example TOML config with `[storage] preset_db`, a systemd unit, smoke checks, troubleshooting, and network exposure notes.
@@ -481,7 +504,7 @@ Important source files:
 
 Near-term work:
 
-- Add release binaries and/or a Docker image.
+- Add ARM/Raspberry Pi binary release automation if maintainers want prebuilt Pi artifacts.
 
 Later work:
 
