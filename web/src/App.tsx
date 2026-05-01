@@ -228,10 +228,10 @@ function App() {
             <Card>
               <CardHeader><CardTitle>Command console</CardTitle><CardDescription>POST JSON to /api/v1/connections/:name/commands.</CardDescription></CardHeader>
               <CardContent className="space-y-4">
-                <Textarea className="json-editor min-h-64" value={payload} onChange={(e) => setPayload(e.target.value)} spellCheck={false} />
+                <Textarea aria-label="Command JSON payload" className="json-editor min-h-64" value={payload} onChange={(e) => setPayload(e.target.value)} spellCheck={false} />
                 <div className="grid gap-3 md:grid-cols-[1fr_10rem]">
                   <label className="flex items-center gap-2 text-sm"><Checkbox checked={waitForResponse} onCheckedChange={(checked) => setWaitForResponse(Boolean(checked))} /> waitForResponse</label>
-                  <Input inputMode="numeric" value={timeoutMs} onChange={(e) => setTimeoutMs(e.target.value)} disabled={!waitForResponse} />
+                  <Input aria-label="Command timeout milliseconds" inputMode="numeric" value={timeoutMs} onChange={(e) => setTimeoutMs(e.target.value)} disabled={!waitForResponse} />
                 </div>
                 <div className="flex flex-wrap gap-2"><Button onClick={() => void sendCommand()}><Send className="mr-2 h-4 w-4" />Send command</Button><Button variant="secondary" onClick={savePreset}><Save className="mr-2 h-4 w-4" />Save as preset</Button></div>
               </CardContent>
@@ -249,7 +249,7 @@ function App() {
           <TabsContent value="presets" className="grid gap-4 lg:grid-cols-[22rem_1fr]">
             <Card><CardHeader><CardTitle>Create preset</CardTitle><CardDescription>Save the current JSON payload for reuse.</CardDescription></CardHeader><CardContent className="space-y-3"><Field label="Preset name"><Input value={presetName} onChange={(e) => setPresetName(e.target.value)} /></Field><Button onClick={savePreset}><Save className="mr-2 h-4 w-4" />Save preset</Button></CardContent></Card>
             <Card><CardHeader><CardTitle>Saved presets</CardTitle><CardDescription>Load, send, or delete stored command payloads.</CardDescription></CardHeader><CardContent className="space-y-3">
-              {presets.length === 0 ? <p className="text-sm text-muted-foreground">No presets saved.</p> : presets.map((preset) => <div key={preset.id} className="rounded-lg border p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div><div className="font-medium">{preset.name}</div><div className="text-xs text-muted-foreground">#{preset.id}</div></div><div className="flex gap-2"><Button size="sm" variant="secondary" onClick={() => applyPreset(preset)}><Play className="mr-1 h-3 w-3" />Load</Button><Button size="sm" onClick={() => void sendCommand(preset.payload)}>Send</Button><Button size="sm" variant="destructive" onClick={() => void removePreset(preset.id)}><Trash2 className="h-3 w-3" /></Button></div></div><pre className="mt-3 max-h-32 overflow-auto rounded bg-muted/30 p-2 text-xs">{JSON.stringify(preset.payload, null, 2)}</pre></div>)}
+              {presets.length === 0 ? <p className="text-sm text-muted-foreground">No presets saved.</p> : presets.map((preset) => <div key={preset.id} className="rounded-lg border p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div><div className="font-medium">{preset.name}</div><div className="text-xs text-muted-foreground">#{preset.id}</div></div><div className="flex gap-2"><Button size="sm" variant="secondary" onClick={() => applyPreset(preset)}><Play className="mr-1 h-3 w-3" />Load</Button><Button size="sm" onClick={() => void sendCommand(preset.payload)}>Send</Button><Button aria-label={`Delete preset ${preset.name}`} size="sm" variant="destructive" onClick={() => void removePreset(preset.id)}><Trash2 className="h-3 w-3" /></Button></div></div><pre className="mt-3 max-h-32 overflow-auto rounded bg-muted/30 p-2 text-xs">{JSON.stringify(preset.payload, null, 2)}</pre></div>)}
             </CardContent></Card>
           </TabsContent>
         </Tabs>

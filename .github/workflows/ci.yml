@@ -41,6 +41,10 @@ jobs:
         working-directory: web
         run: pnpm install --frozen-lockfile
 
+      - name: Install Playwright Chromium
+        working-directory: web
+        run: pnpm exec playwright install --with-deps chromium
+
       - name: Typecheck web dashboard
         working-directory: web
         run: pnpm typecheck
@@ -48,6 +52,10 @@ jobs:
       - name: Build web dashboard
         working-directory: web
         run: pnpm build
+
+      - name: Run dashboard browser E2E tests
+        working-directory: web
+        run: pnpm e2e
 
       - name: Install native Linux build dependencies
         run: |

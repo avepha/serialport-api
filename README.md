@@ -102,6 +102,21 @@ pnpm dev
 
 The Axum server looks for local development assets at `web/dist` when present. Release archives and Docker images package the same compiled dashboard at the runtime path `./web/index.html` and `./web/assets/...`. If the dashboard has not been built in a local checkout, `/dashboard` returns a clear missing-dashboard page instead of crashing the API server.
 
+### Dashboard browser E2E tests
+
+The dashboard has a Playwright browser E2E suite under `web/e2e/` with configuration in `web/playwright.config.ts`. The tests run against a local Vite dev server on `127.0.0.1:4174`, mock all same-origin `/api/v1/**` responses in the browser context, and install a deterministic `EventSource` mock. They do not require `cargo run`, `--real-serial`, Docker, external services, or attached serial hardware.
+
+Install dependencies and Chromium once, then run the suite from `web/`:
+
+```bash
+cd web
+pnpm install --frozen-lockfile
+pnpm exec playwright install --with-deps chromium
+pnpm e2e
+```
+
+Helpful local variants are `pnpm e2e:headed`, `pnpm e2e:ui`, and `pnpm e2e:debug`. CI installs Playwright Chromium after `pnpm install --frozen-lockfile` and runs `pnpm e2e` after the dashboard typecheck/build steps.
+
 ## Run the server
 
 Start the Axum HTTP server:
