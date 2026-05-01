@@ -11,6 +11,9 @@ pub enum SerialportApiError {
     #[error("serial port error: {0}")]
     SerialPort(#[from] serialport::Error),
 
+    #[error("serial I/O error: {0}")]
+    SerialIo(#[from] std::io::Error),
+
     #[error("connection not found: {0}")]
     ConnectionNotFound(String),
 

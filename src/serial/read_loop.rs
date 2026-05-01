@@ -115,6 +115,93 @@ where
     Ok(processed)
 }
 
+pub trait RealSerialLineSource: Clone + Send + Sync + 'static {
+    fn drain_lines(&self, connection_name: &str, delimiter: &str) -> Result<Vec<Vec<u8>>>;
+}
+
+impl<F> RealSerialLineSource for crate::serial::real_transport::RealSerialTransport<F>
+where
+    F: crate::serial::real_transport::SerialPortFactory,
+{
+    fn drain_lines(&self, connection_name: &str, delimiter: &str) -> Result<Vec<Vec<u8>>> {
+        self.drain_lines(connection_name, delimiter)
+    }
+}
+
+pub fn drain_real_serial_lines<M, R>(
+    manager: &M,
+    read_source: &R,
+    connection_name: &str,
+    delimiter: &str,
+) -> Result<usize>
+where
+    M: SerialEventRecorder,
+    R: RealSerialLineSource,
+{
+    let lines = read_source.drain_lines(connection_name, delimiter)?;
+    let processed = lines.len();
+
+    for line in lines {
+        manager.record_serial_event_for_connection(
+            connection_name,
+            crate::protocol::parse_line(&line),
+        );
+    }
+
+    Ok(processed)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RealReadLoopStop {
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RealReadLoopStop {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+pub fn spawn_real_read_loop<M, R>(
+    manager: M,
+    read_source: R,
+    connection_name: String,
+    delimiter: String,
+    stop: RealReadLoopStop,
+) -> tokio::task::JoinHandle<()>
+where
+    M: SerialEventRecorder,
+    R: RealSerialLineSource,
+{
+    tokio::spawn(async move {
+        while !stop.is_stopped() {
+            match drain_real_serial_lines(&manager, &read_source, &connection_name, &delimiter) {
+                Ok(0) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => {
+                    if matches!(
+                        error,
+                        crate::error::SerialportApiError::ConnectionNotFound(_)
+                    ) {
+                        break;
+                    }
+                    manager.record_serial_error_for_connection(&connection_name, error.to_string());
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+    })
+}
+
 pub fn spawn_mock_read_loop<M, R>(
     manager: M,
     read_source: R,
@@ -134,6 +221,127 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct FakeRealSerialReadSource {
+        bytes_by_connection: Arc<Mutex<BTreeMap<String, VecDeque<u8>>>>,
+        buffers_by_connection: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    }
+
+    impl FakeRealSerialReadSource {
+        fn push_bytes(&self, connection_name: impl Into<String>, bytes: &[u8]) {
+            self.bytes_by_connection
+                .lock()
+                .expect("fake real read source byte lock poisoned")
+                .entry(connection_name.into())
+                .or_default()
+                .extend(bytes.iter().copied());
+        }
+
+        fn buffered_bytes(&self, connection_name: &str) -> Vec<u8> {
+            self.buffers_by_connection
+                .lock()
+                .expect("fake real read source buffer lock poisoned")
+                .get(connection_name)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    impl RealSerialLineSource for FakeRealSerialReadSource {
+        fn drain_lines(&self, connection_name: &str, delimiter: &str) -> Result<Vec<Vec<u8>>> {
+            let mut bytes_by_connection = self
+                .bytes_by_connection
+                .lock()
+                .expect("fake real read source byte lock poisoned");
+            let unread = bytes_by_connection
+                .entry(connection_name.to_string())
+                .or_default();
+
+            let mut buffers = self
+                .buffers_by_connection
+                .lock()
+                .expect("fake real read source buffer lock poisoned");
+            let buffer = buffers.entry(connection_name.to_string()).or_default();
+            buffer.extend(unread.drain(..));
+
+            let delimiter = delimiter.as_bytes();
+            let mut lines = Vec::new();
+            while let Some(index) = buffer
+                .windows(delimiter.len())
+                .position(|window| window == delimiter)
+            {
+                lines.push(buffer.drain(..index + delimiter.len()).collect());
+            }
+
+            Ok(lines)
+        }
+    }
+
+    #[test]
+    fn real_read_source_drains_complete_delimited_lines() {
+        let source = FakeRealSerialReadSource::default();
+        source.push_bytes("default", b"{\"reqId\":\"1\",\"ok\":true}\r\nhello");
+
+        let lines = source.drain_lines("default", "\r\n").unwrap();
+
+        assert_eq!(lines, vec![b"{\"reqId\":\"1\",\"ok\":true}\r\n".to_vec()]);
+        assert_eq!(source.buffered_bytes("default"), b"hello".to_vec());
+    }
+
+    #[test]
+    fn real_read_lines_record_json_response_for_waited_commands() {
+        use crate::serial::manager::{ConnectionManager, InMemoryConnectionManager};
+
+        let manager = InMemoryConnectionManager::default();
+        let source = FakeRealSerialReadSource::default();
+        source.push_bytes("default", b"{\"reqId\":\"abc\",\"ok\":true}\r\n");
+
+        let processed = drain_real_serial_lines(&manager, &source, "default", "\r\n").unwrap();
+
+        assert_eq!(processed, 1);
+        assert_eq!(
+            manager.take_response("default", "abc").unwrap(),
+            Some(serde_json::json!({"reqId":"abc","ok":true}))
+        );
+        assert_eq!(manager.events().unwrap()[0].event, "serial.json");
+    }
+
+    #[tokio::test]
+    async fn spawned_real_read_loop_records_lines_and_stops() {
+        use crate::serial::manager::InMemoryConnectionManager;
+
+        let manager = InMemoryConnectionManager::default();
+        let source = FakeRealSerialReadSource::default();
+        let stop = RealReadLoopStop::new();
+
+        let handle = spawn_real_read_loop(
+            manager.clone(),
+            source.clone(),
+            "default".to_string(),
+            "\r\n".to_string(),
+            stop.clone(),
+        );
+
+        source.push_bytes("default", b"{\"reqId\":\"loop-1\",\"ok\":true}\r\n");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if manager
+                    .take_response("default", "loop-1")
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        stop.stop();
+        handle.await.unwrap();
+    }
 
     #[test]
     fn mock_read_source_drains_lines_and_errors_for_named_connection() {

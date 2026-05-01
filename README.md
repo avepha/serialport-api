@@ -4,9 +4,9 @@
 
 ## Status
 
-> **Status: rewrite in progress.** The current API server, connection manager, command queue, and event stream are mock/in-memory foundations. Physical serial read/write loops, waited command responses, preset storage, CI, and Raspberry Pi packaging are planned but not complete yet.
+> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. An opt-in `--real-serial` mode can open OS serial ports and run read/write lifecycle handling. Preset storage and Raspberry Pi packaging are planned but not complete yet.
 
-Use the current server to exercise the HTTP API shape, route compatibility, request/response JSON, command framing, and event-stream formatting. Do not expect it to communicate with real serial hardware yet, except for listing ports via `serialport::available_ports()`.
+Use the current default server to exercise the HTTP API shape, route compatibility, request/response JSON, command framing, and event-stream formatting without hardware. Use `serve --real-serial` only when you intentionally want to open and communicate with attached serial devices.
 
 ## Features
 
@@ -17,19 +17,18 @@ Implemented now:
 - [x] Health endpoint
 - [x] Serial port listing endpoint backed by `serialport::available_ports()`
 - [x] Mock/in-memory named connection lifecycle
-- [x] Mock command endpoint with generated or preserved `reqId`
+- [x] Command endpoint with generated or preserved `reqId`
 - [x] JSON command framing as UTF-8 JSON plus delimiter, usually `\r\n`
 - [x] Server-Sent Events endpoint for recorded mock serial events
 - [x] Legacy aliases: `/list`, `/connect`, `/disconnect`, `/info`, `/commit`
+- [x] Waited command responses matched by string `reqId`
+- [x] Opt-in mock-device/scripted responses for hardware-free response tests
+- [x] Opt-in real serial mode for opening/writing/reading OS serial ports
 - [x] Unit and route tests for current behavior
 
 Planned / not complete yet:
 
-- [ ] Real serial transport read/write loops
-- [ ] Matching command responses by `reqId`
-- [ ] Command timeout handling
 - [ ] Config file support
-- [ ] Mock serial device mode / scripted responses
 - [ ] SQLite saved presets
 - [ ] Raspberry Pi install guide and systemd service
 - [ ] GitHub Actions CI
@@ -66,6 +65,14 @@ cargo run -- serve --host 127.0.0.1 --port 4002
 ```
 
 Port `4002` is the default compatibility port from the older JavaScript `sg-mcu-com` workflow.
+
+By default, `serve` uses the mock/in-memory transport and does not open physical serial ports. To use attached serial hardware, start the server with the explicit real mode flag:
+
+```bash
+cargo run -- serve --host 127.0.0.1 --port 4002 --real-serial
+```
+
+In real serial mode, `POST /api/v1/connections` opens the requested OS port using the provided `port`, `baudRate`, and `delimiter`; command routes write framed JSON bytes to that handle; and delimiter-terminated inbound lines are parsed into the existing SSE events and waited-response queues. Hardware smoke testing requires a connected device or loopback adapter. Do not use `--real-serial` together with `--mock-device` or `--mock-script`; the server rejects those combinations.
 
 You can also configure the server with environment variables:
 
@@ -164,7 +171,7 @@ Do not rely on a specific device path being present; it depends on the host mach
 
 ### `POST /api/v1/connections`
 
-Create or replace a named mock/in-memory connection. This records connection metadata but does not open the physical serial port yet.
+Create or replace a named connection. In the default mock server this records connection metadata only; in `--real-serial` mode it opens the requested OS serial port.
 
 ```bash
 curl -s -X POST http://127.0.0.1:4002/api/v1/connections \
@@ -214,7 +221,7 @@ Response:
 
 ### `POST /api/v1/connections/:name/commands`
 
-Queue a JSON command for a named connection. Current behavior records the framed command in memory and returns immediately; it does not write to a real serial port yet.
+Queue a JSON command for a named connection. In the default mock server this records the framed command in memory; in `--real-serial` mode it writes the framed bytes to the opened serial port.
 
 ```bash
 curl -s -X POST http://127.0.0.1:4002/api/v1/connections/default/commands \
@@ -364,7 +371,7 @@ Inbound lines are currently parsed as:
 - non-JSON or lossy UTF-8 text fallback -> `serial.text`
 - future/read errors recorded by the manager -> `serial.error`
 
-The parser and mock event stream are implemented, but background serial read loops that feed real inbound hardware data into the event stream are not implemented yet.
+The default server remains hardware-free. In `--real-serial` mode, delimiter-terminated inbound hardware lines are parsed into the same event stream and string `reqId` response queues.
 
 ## Development
 
@@ -401,12 +408,8 @@ Important source files:
 
 Near-term work:
 
-- Wire real serial transport while preserving mockable tests.
-- Add background read loops that parse serial lines into events.
-- Implement request/response matching by `reqId`.
-- Honor `waitForResponse` and `timeoutMs` for command calls.
-- Add mock serial device mode and scripted responses.
 - Add config file support for server and serial defaults.
+- Add persistent saved connection profiles/presets.
 
 Later work:
 
