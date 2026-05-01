@@ -1,12 +1,13 @@
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{
         sse::{Event, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{delete, get, post},
     Json, Router,
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -106,6 +108,7 @@ pub struct AppState<L, C> {
     port_lister: L,
     connection_manager: C,
     preset_store: Arc<dyn PresetStore>,
+    dashboard_assets: PathBuf,
 }
 
 impl<L, C> AppState<L, C> {
@@ -114,6 +117,7 @@ impl<L, C> AppState<L, C> {
             port_lister,
             connection_manager,
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         }
     }
 
@@ -125,6 +129,7 @@ impl<L, C> AppState<L, C> {
             port_lister,
             connection_manager,
             preset_store: Arc::new(preset_store),
+            dashboard_assets: default_dashboard_assets_dir(),
         }
     }
 
@@ -137,8 +142,53 @@ impl<L, C> AppState<L, C> {
             port_lister,
             connection_manager,
             preset_store,
+            dashboard_assets: default_dashboard_assets_dir(),
         }
     }
+
+    pub fn with_dashboard_assets<P>(mut self, dashboard_assets: P) -> Self
+    where
+        P: Into<PathBuf>,
+    {
+        self.dashboard_assets = dashboard_assets.into();
+        self
+    }
+}
+
+fn default_dashboard_assets_dir() -> PathBuf {
+    let built = PathBuf::from("web/dist");
+    if built.join("index.html").is_file() {
+        return built;
+    }
+
+    let packaged = PathBuf::from("web");
+    if is_packaged_dashboard_dir(&packaged) {
+        packaged
+    } else {
+        built
+    }
+}
+
+fn is_packaged_dashboard_dir(root: &FsPath) -> bool {
+    if !root.join("assets").is_dir() {
+        return false;
+    }
+
+    let Ok(index) = std::fs::read_to_string(root.join("index.html")) else {
+        return false;
+    };
+
+    index_references_built_asset(&index, ".js") || index_references_built_asset(&index, ".css")
+}
+
+fn index_references_built_asset(index: &str, extension: &str) -> bool {
+    index.match_indices("/assets/").any(|(start, _)| {
+        let asset_ref = &index[start..];
+        let end = asset_ref
+            .find(['"', '\'', '<', '>', ' '])
+            .unwrap_or(asset_ref.len());
+        asset_ref[..end].ends_with(extension)
+    })
 }
 
 pub fn router() -> Router {
@@ -146,6 +196,7 @@ pub fn router() -> Router {
         port_lister: SystemPortLister,
         connection_manager: InMemoryConnectionManager::default(),
         preset_store: Arc::new(InMemoryPresetStore::default()),
+        dashboard_assets: default_dashboard_assets_dir(),
     })
 }
 
@@ -157,6 +208,7 @@ where
         port_lister,
         connection_manager: InMemoryConnectionManager::default(),
         preset_store: Arc::new(InMemoryPresetStore::default()),
+        dashboard_assets: default_dashboard_assets_dir(),
     })
 }
 
@@ -166,6 +218,9 @@ where
     C: ConnectionManager,
 {
     Router::new()
+        .route("/", get(dashboard::<L, C>))
+        .route("/dashboard", get(dashboard::<L, C>))
+        .route("/assets/:file", get(dashboard_asset::<L, C>))
         .route("/api/v1/health", get(health))
         .route("/api/v1/events", get(events::<L, C>))
         .route("/api/v1/events/ws", get(events_ws::<L, C>))
@@ -196,6 +251,84 @@ where
         .route("/info", get(connections::<L, C>))
         .route("/disconnect", post(disconnect_alias::<L, C>))
         .with_state(state)
+}
+
+async fn dashboard<L, C>(State(state): State<AppState<L, C>>) -> Response
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    serve_dashboard_index(&state.dashboard_assets)
+}
+
+async fn dashboard_asset<L, C>(
+    State(state): State<AppState<L, C>>,
+    Path(file): Path<String>,
+) -> Response
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    if file.contains('/') || file.contains("..") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    serve_dashboard_file(&state.dashboard_assets.join("assets").join(file))
+}
+
+fn serve_dashboard_index(root: &FsPath) -> Response {
+    let index = root.join("index.html");
+    match std::fs::read_to_string(index) {
+        Ok(html) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            html,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            missing_dashboard_html(root),
+        )
+            .into_response(),
+    }
+}
+
+fn serve_dashboard_file(path: &FsPath) -> Response {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let content_type = content_type_for(path);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn content_type_for(path: &FsPath) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("map") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+fn missing_dashboard_html(root: &FsPath) -> String {
+    format!(
+        r#"<!doctype html><html><head><title>Dashboard not built</title></head><body><h1>Dashboard assets are not available</h1><p>Build the dashboard with <code>cd web && pnpm install --frozen-lockfile && pnpm build</code>.</p><p>Expected runtime directory: <code>{}</code></p></body></html>"#,
+        root.display()
+    )
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -636,6 +769,146 @@ mod tests {
         }
     }
 
+    fn app_with_dashboard_assets(asset_root: PathBuf) -> Router {
+        router_with_state(
+            AppState::new(
+                MockPortLister { ports: Vec::new() },
+                InMemoryConnectionManager::default(),
+            )
+            .with_dashboard_assets(asset_root),
+        )
+    }
+
+    fn dashboard_fixture() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "serialport-api-dashboard-test-{}",
+            next_socket_io_sid()
+        ));
+        let assets = root.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            r#"<!doctype html><html><head><script type="module" crossorigin src="/assets/index-test.js"></script><link rel="stylesheet" crossorigin href="/assets/index-test.css"></head><body><div id="root"></div></body></html>"#,
+        )
+        .unwrap();
+        std::fs::write(assets.join("index-test.js"), "console.log('dashboard');").unwrap();
+        std::fs::write(assets.join("index-test.css"), "body{margin:0}").unwrap();
+        root
+    }
+
+    fn source_dashboard_fixture() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "serialport-api-dashboard-source-{}",
+            next_socket_io_sid()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            r#"<!doctype html><html><head></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>"#,
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn packaged_dashboard_dir_rejects_vite_source_index_without_built_assets() {
+        let root = source_dashboard_fixture();
+
+        assert!(!is_packaged_dashboard_dir(&root));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dashboard_route_serves_html_shell_from_configured_assets() {
+        let root = dashboard_fixture();
+        let response = app_with_dashboard_assets(root.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("/assets/index-test.js"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dashboard_root_route_serves_same_html_shell() {
+        let root = dashboard_fixture();
+        let response = app_with_dashboard_assets(root.clone())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("/assets/index-test.css"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dashboard_asset_route_serves_vite_assets() {
+        let root = dashboard_fixture();
+        let response = app_with_dashboard_assets(root.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/index-test.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/javascript; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"console.log('dashboard');");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dashboard_missing_assets_return_helpful_response_without_crashing() {
+        let root = std::env::temp_dir().join(format!(
+            "serialport-api-dashboard-missing-{}",
+            next_socket_io_sid()
+        ));
+        let response = app_with_dashboard_assets(root)
+            .oneshot(
+                Request::builder()
+                    .uri("/dashboard")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Dashboard assets are not available"));
+    }
+
     #[derive(Clone, Default)]
     struct FakeSerialPortFactory {
         state: std::sync::Arc<std::sync::Mutex<FakeFactoryState>>,
@@ -994,6 +1267,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
 
         let create_response = app
@@ -1089,6 +1363,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
 
         let create_response = app
@@ -1136,6 +1411,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
 
         let create_response = app
@@ -1195,6 +1471,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager,
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         })
         .oneshot(
             Request::builder()
@@ -1236,6 +1513,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager,
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         })
         .oneshot(
             Request::builder()
@@ -1279,6 +1557,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager,
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1329,6 +1608,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager,
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1399,6 +1679,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
 
         for uri in [
@@ -1429,6 +1710,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
 
         let create_response = app
@@ -1551,6 +1833,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
 
         let create_response = app
@@ -1595,6 +1878,7 @@ mod tests {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
 
         let create_response = app
@@ -1663,6 +1947,7 @@ mod tests {
             },
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
         });
 
         let list_response = app

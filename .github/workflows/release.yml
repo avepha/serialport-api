@@ -27,6 +27,28 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck web dashboard
+        working-directory: web
+        run: pnpm typecheck
+
+      - name: Build web dashboard
+        working-directory: web
+        run: pnpm build
+
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
@@ -42,7 +64,9 @@ jobs:
   linux-binary:
     name: Linux binary (${{ matrix.target }})
     runs-on: ubuntu-latest
-    needs: verify
+    needs:
+      - verify
+      - web-build
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +85,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Download web dashboard bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dashboard-dist
+          path: web-dist
 
       - name: Install native Linux build dependencies
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -92,14 +122,26 @@ jobs:
           mkdir -p "$package_dir"
           cp "target/${TARGET}/release/serialport-api" "$package_dir/"
           cp README.md LICENSE "$package_dir/"
+          mkdir -p "$package_dir/web"
+          cp -R web-dist/. "$package_dir/web/"
           {
             echo "name=serialport-api"
             echo "tag=${GITHUB_REF_NAME}"
             echo "target=${TARGET}"
             echo "commit=${GITHUB_SHA}"
+            echo "web_bundle=web/dist"
+            echo "web_built=true"
           } > "$package_dir/ARTIFACT.txt"
           tar -C "dist/${TARGET}" -czf "$archive" serialport-api
           sha256sum "$archive" > "$archive.sha256"
+
+      - name: Verify package contents
+        run: |
+          set -euo pipefail
+          archive="serialport-api-${GITHUB_REF_NAME}-${TARGET}.tar.gz"
+          tar -tzf "$archive" | grep -Fx "serialport-api/web/index.html"
+          tar -tzf "$archive" | grep -E '^serialport-api/web/assets/.+\.(js|css)$'
+          tar -xOzf "$archive" serialport-api/ARTIFACT.txt | grep -Fx "web_built=true"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -107,6 +149,40 @@ jobs:
           files: |
             serialport-api-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
             serialport-api-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+
+  web-build:
+    name: Build web dashboard bundle
+    runs-on: ubuntu-latest
+    needs: verify
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build web dashboard
+        working-directory: web
+        run: pnpm build
+
+      - name: Upload web dashboard bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dashboard-dist
+          path: web/dist
+          if-no-files-found: error
 
   docker-image:
     name: Docker image

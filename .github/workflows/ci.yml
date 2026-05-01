@@ -27,6 +27,28 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck web dashboard
+        working-directory: web
+        run: pnpm typecheck
+
+      - name: Build web dashboard
+        working-directory: web
+        run: pnpm build
+
       - name: Install native Linux build dependencies
         run: |
           sudo apt-get update

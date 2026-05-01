@@ -4,7 +4,7 @@
 
 ## Status
 
-> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. Optional TOML config defaults, opt-in `--real-serial` mode, and saved command presets with opt-in SQLite persistence are available. Raspberry Pi/systemd deployment docs, Docker runtime packaging, and tag-triggered release automation are available.
+> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. Optional TOML config defaults, opt-in `--real-serial` mode, saved command presets with opt-in SQLite persistence, and a built-in React dashboard are available. Raspberry Pi/systemd deployment docs, Docker runtime packaging, and tag-triggered release automation are available.
 
 Use the current default server to exercise the HTTP API shape, route compatibility, request/response JSON, command framing, and event-stream formatting without hardware. Use `serve --real-serial` only when you intentionally want to open and communicate with attached serial devices.
 
@@ -29,6 +29,7 @@ Implemented now:
 - [x] Coordinated real serial read-loop lifecycle with hardware-free tests
 - [x] Optional TOML config file defaults for server, serial, and storage settings
 - [x] Saved command preset CRUD routes under `/api/v1/presets`
+- [x] Built-in React/TypeScript dashboard served at `/dashboard`, `/`, and `/assets/*`
 - [x] Opt-in SQLite preset persistence with `--preset-db` or `[storage] preset_db`
 - [x] Raspberry Pi install guide and systemd service examples
 - [x] Dockerfile and Docker Compose example for local/container runs
@@ -74,6 +75,32 @@ curl -s http://127.0.0.1:4002/api/v1/health
 ```
 
 The default container command starts `serve --host 0.0.0.0 --port 4002` in mock/in-memory mode. For config mounts, SQLite preset volumes, Linux serial-device pass-through, Docker Compose, and tag-triggered release workflow details, see [`docs/docker-release.md`](docs/docker-release.md).
+
+## Dashboard
+
+The server can serve the production dashboard from Vite build output. Build it locally with pnpm:
+
+```bash
+cd web
+pnpm install --frozen-lockfile
+pnpm build
+```
+
+Then run the Rust server from the repository root and open:
+
+```text
+http://127.0.0.1:4002/dashboard
+```
+
+During frontend development, run Vite from `web/`:
+
+```bash
+cd web
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+The Axum server looks for local development assets at `web/dist` when present. Release archives and Docker images package the same compiled dashboard at the runtime path `./web/index.html` and `./web/assets/...`. If the dashboard has not been built in a local checkout, `/dashboard` returns a clear missing-dashboard page instead of crashing the API server.
 
 ## Run the server
 
@@ -425,7 +452,14 @@ Other preset routes:
 
 For Docker-based local runs and release packaging, see [`docs/docker-release.md`](docs/docker-release.md). The repository includes a root `Dockerfile`, an optional [`examples/docker-compose.yml`](examples/docker-compose.yml), and a tag-triggered GitHub Actions release workflow for deterministic Linux binary archives and GHCR image publishing.
 
-Release binary archives are named `serialport-api-${TAG}-${TARGET}.tar.gz` with matching `.sha256` files. The currently automated Linux targets are:
+Release binary archives are named `serialport-api-${TAG}-${TARGET}.tar.gz` with matching `.sha256` files. Each archive includes the latest compiled dashboard bundle:
+
+```text
+serialport-api/web/index.html
+serialport-api/web/assets/...
+```
+
+The currently automated Linux targets are:
 
 - `x86_64-unknown-linux-gnu` for Linux desktops/servers.
 - `aarch64-unknown-linux-gnu` for 64-bit Raspberry Pi OS / ARM64 Linux.

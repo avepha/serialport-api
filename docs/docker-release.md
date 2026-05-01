@@ -14,7 +14,7 @@ From the repository root:
 docker build -t serialport-api:local .
 ```
 
-The image builds the Rust binary with locked Cargo dependencies and installs it at `/usr/local/bin/serialport-api`. The runtime image includes `ca-certificates` and `libudev1`; `libudev1` is needed by Linux serial-device enumeration through the `serialport` crate.
+The image builds the Rust binary with locked Cargo dependencies and installs it at `/usr/local/bin/serialport-api`. It also builds the React dashboard with Node.js 20/pnpm and copies the compiled `web/dist` bundle into the runtime image at `/app/web/`, so `/dashboard` is available from the default container. The runtime image includes `ca-certificates` and `libudev1`; `libudev1` is needed by Linux serial-device enumeration through the `serialport` crate.
 
 ## Run in default mock mode
 
@@ -137,8 +137,10 @@ The workflow:
 
 - Runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` before packaging or publishing.
 - Builds locked Linux release binaries with explicit targets using `cargo build --release --locked --target "$TARGET"`.
+- Builds the React dashboard once with Node.js 20/pnpm and packages that compiled bundle into every Linux archive.
 - Publishes deterministic tarballs named `serialport-api-${TAG}-${TARGET}.tar.gz` with matching `serialport-api-${TAG}-${TARGET}.tar.gz.sha256` checksum files.
-- Packages each archive with one top-level `serialport-api/` directory containing the `serialport-api` executable, `README.md`, `LICENSE`, and `ARTIFACT.txt` metadata.
+- Packages each archive with one top-level `serialport-api/` directory containing the `serialport-api` executable, `README.md`, `LICENSE`, `ARTIFACT.txt` metadata, and `web/index.html` plus `web/assets/...` dashboard files.
+- Verifies archive contents before upload by checking `serialport-api/web/index.html`, at least one compiled asset under `serialport-api/web/assets/`, and `web_built=true` in `ARTIFACT.txt`.
 - Builds and publishes a GHCR image tagged with the pushed version tag using the repository `GITHUB_TOKEN`.
 
 Automated Linux binary targets:
@@ -185,6 +187,7 @@ docker run --rm -p 4002:4002 serialport-api:local
 In another terminal:
 
 ```bash
+curl -i -s http://127.0.0.1:4002/dashboard | head -20
 curl -s http://127.0.0.1:4002/api/v1/health
 curl -s http://127.0.0.1:4002/api/v1/ports
 curl -s -X POST http://127.0.0.1:4002/api/v1/connections \

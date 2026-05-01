@@ -1,6 +1,8 @@
 .git
 .gitignore
 target
+web/node_modules
+web/dist
 Dockerfile
 .dockerignore
 *.db
