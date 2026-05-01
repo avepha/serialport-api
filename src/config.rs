@@ -15,6 +15,13 @@ pub struct FileConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub serial: SerialConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct StorageConfig {
+    pub preset_db: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -99,6 +106,7 @@ pub struct CliServeOverrides {
     pub mock_device: bool,
     pub mock_script: Option<PathBuf>,
     pub real_serial: bool,
+    pub preset_db: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -154,6 +162,7 @@ pub struct ResolvedServeConfig {
     pub mock_script: Option<PathBuf>,
     pub real_serial: bool,
     pub serial_defaults: SerialDefaults,
+    pub preset_db: Option<PathBuf>,
 }
 
 impl fmt::Display for ResolvedServeConfig {
@@ -186,6 +195,7 @@ pub fn resolve_serve_config(
         mock_device,
         mock_script,
         real_serial,
+        preset_db: cli.preset_db.or(file.storage.preset_db),
         serial_defaults: SerialDefaults {
             default_port: file.serial.default_port,
             default_baud_rate: file
@@ -418,6 +428,29 @@ mock_device = true
         assert!(resolved.mock_script.is_none());
         assert!(!resolved.real_serial);
         assert_eq!(resolved.serial_defaults, SerialDefaults::default());
+        assert!(resolved.preset_db.is_none());
+    }
+
+    #[test]
+    fn storage_config_resolves_preset_db_and_cli_override_wins() {
+        let file =
+            FileConfig::from_toml_str("[storage]\npreset_db = \"./from-config.db\"\n").unwrap();
+        let resolved = resolve_serve_config(
+            CliServeOverrides::default(),
+            EnvServeConfig::default(),
+            file,
+        )
+        .unwrap();
+        assert_eq!(resolved.preset_db, Some(PathBuf::from("./from-config.db")));
+
+        let cli = CliServeOverrides {
+            preset_db: Some(PathBuf::from("./from-cli.db")),
+            ..CliServeOverrides::default()
+        };
+        let file =
+            FileConfig::from_toml_str("[storage]\npreset_db = \"./from-config.db\"\n").unwrap();
+        let resolved = resolve_serve_config(cli, EnvServeConfig::default(), file).unwrap();
+        assert_eq!(resolved.preset_db, Some(PathBuf::from("./from-cli.db")));
     }
 
     fn unique_temp_dir(test_name: &str) -> PathBuf {

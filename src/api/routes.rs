@@ -10,12 +10,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use crate::serial::manager::{
     list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
     PortInfo, SerialPortLister, SystemPortLister,
 };
+use crate::storage::{CreatePreset, InMemoryPresetStore, Preset, PresetStore, PresetStoreError};
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -74,10 +75,27 @@ struct WaitedCommandResponse {
     response: Value,
 }
 
+#[derive(Debug, Serialize)]
+struct PresetsResponse {
+    presets: Vec<Preset>,
+}
+
+#[derive(Debug, Serialize)]
+struct PresetResponse {
+    preset: Preset,
+}
+
+#[derive(Debug, Serialize)]
+struct DeletePresetResponse {
+    status: &'static str,
+    id: i64,
+}
+
 #[derive(Clone)]
 pub struct AppState<L, C> {
     port_lister: L,
     connection_manager: C,
+    preset_store: Arc<dyn PresetStore>,
 }
 
 impl<L, C> AppState<L, C> {
@@ -85,6 +103,30 @@ impl<L, C> AppState<L, C> {
         Self {
             port_lister,
             connection_manager,
+            preset_store: Arc::new(InMemoryPresetStore::default()),
+        }
+    }
+
+    pub fn with_preset_store<P>(port_lister: L, connection_manager: C, preset_store: P) -> Self
+    where
+        P: PresetStore,
+    {
+        Self {
+            port_lister,
+            connection_manager,
+            preset_store: Arc::new(preset_store),
+        }
+    }
+
+    pub fn with_preset_store_arc(
+        port_lister: L,
+        connection_manager: C,
+        preset_store: Arc<dyn PresetStore>,
+    ) -> Self {
+        Self {
+            port_lister,
+            connection_manager,
+            preset_store,
         }
     }
 }
@@ -93,6 +135,7 @@ pub fn router() -> Router {
     router_with_state(AppState {
         port_lister: SystemPortLister,
         connection_manager: InMemoryConnectionManager::default(),
+        preset_store: Arc::new(InMemoryPresetStore::default()),
     })
 }
 
@@ -103,6 +146,7 @@ where
     router_with_state(AppState {
         port_lister,
         connection_manager: InMemoryConnectionManager::default(),
+        preset_store: Arc::new(InMemoryPresetStore::default()),
     })
 }
 
@@ -116,6 +160,16 @@ where
         .route("/api/v1/events", get(events::<L, C>))
         .route("/api/v1/ports", get(ports::<L, C>))
         .route("/list", get(ports::<L, C>))
+        .route(
+            "/api/v1/presets",
+            get(list_presets::<L, C>).post(create_preset::<L, C>),
+        )
+        .route(
+            "/api/v1/presets/:id",
+            get(get_preset::<L, C>)
+                .put(update_preset::<L, C>)
+                .delete(delete_preset::<L, C>),
+        )
         .route(
             "/api/v1/connections",
             post(connect::<L, C>).get(connections::<L, C>),
@@ -171,6 +225,95 @@ where
     }));
 
     Ok(Sse::new(stream))
+}
+
+async fn list_presets<L, C>(
+    State(state): State<AppState<L, C>>,
+) -> Result<Json<PresetsResponse>, axum::response::Response>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    state
+        .preset_store
+        .list()
+        .map(|presets| Json(PresetsResponse { presets }))
+        .map_err(preset_error_response)
+}
+
+async fn create_preset<L, C>(
+    State(state): State<AppState<L, C>>,
+    Json(request): Json<CreatePreset>,
+) -> Result<axum::response::Response, axum::response::Response>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    state
+        .preset_store
+        .create(request)
+        .map(|preset| (StatusCode::CREATED, Json(PresetResponse { preset })).into_response())
+        .map_err(preset_error_response)
+}
+
+async fn get_preset<L, C>(
+    State(state): State<AppState<L, C>>,
+    Path(id): Path<i64>,
+) -> Result<Json<PresetResponse>, axum::response::Response>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    state
+        .preset_store
+        .get(id)
+        .map(|preset| Json(PresetResponse { preset }))
+        .map_err(preset_error_response)
+}
+
+async fn update_preset<L, C>(
+    State(state): State<AppState<L, C>>,
+    Path(id): Path<i64>,
+    Json(request): Json<CreatePreset>,
+) -> Result<Json<PresetResponse>, axum::response::Response>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    state
+        .preset_store
+        .update(id, request)
+        .map(|preset| Json(PresetResponse { preset }))
+        .map_err(preset_error_response)
+}
+
+async fn delete_preset<L, C>(
+    State(state): State<AppState<L, C>>,
+    Path(id): Path<i64>,
+) -> Result<Json<DeletePresetResponse>, axum::response::Response>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    state
+        .preset_store
+        .delete(id)
+        .map(|id| {
+            Json(DeletePresetResponse {
+                status: "deleted",
+                id,
+            })
+        })
+        .map_err(preset_error_response)
+}
+
+fn preset_error_response(error: PresetStoreError) -> axum::response::Response {
+    let status = match error {
+        PresetStoreError::InvalidName | PresetStoreError::InvalidPayload => StatusCode::BAD_REQUEST,
+        PresetStoreError::NotFound(_) => StatusCode::NOT_FOUND,
+        PresetStoreError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({"error": error.to_string()}))).into_response()
 }
 
 async fn connect<L, C>(
@@ -541,6 +684,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preset_routes_crud_validate_and_report_missing_ids() {
+        let app = router();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/presets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload, json!({"presets": []}));
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/presets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Read IMU","payload":{"method":"query","topic":"imu.read","data":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::CREATED);
+        let body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload,
+            json!({"preset":{"id":1,"name":"Read IMU","payload":{"method":"query","topic":"imu.read","data":{}}}})
+        );
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/presets/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+
+        let update_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/presets/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"Read temperature","payload":{"method":"query","topic":"temperature.read","data":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_response.status(), StatusCode::OK);
+        let body = to_bytes(update_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload,
+            json!({"preset":{"id":1,"name":"Read temperature","payload":{"method":"query","topic":"temperature.read","data":{}}}})
+        );
+
+        let invalid_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/presets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Bad","payload":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+
+        let delete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/presets/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        let body = to_bytes(delete_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload, json!({"status":"deleted","id":1}));
+
+        let missing_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/presets/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn health_route_returns_status_and_version() {
         let response = router()
             .oneshot(
@@ -604,6 +870,7 @@ mod tests {
         let app = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         });
 
         let create_response = app
@@ -698,6 +965,7 @@ mod tests {
         let app = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         });
 
         let create_response = app
@@ -744,6 +1012,7 @@ mod tests {
         let app = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         });
 
         let create_response = app
@@ -802,6 +1071,7 @@ mod tests {
         let response = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager,
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         })
         .oneshot(
             Request::builder()
@@ -842,6 +1112,7 @@ mod tests {
         let response = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager,
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         })
         .oneshot(
             Request::builder()
@@ -876,6 +1147,7 @@ mod tests {
         let app = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager.clone(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         });
 
         let create_response = app
@@ -997,6 +1269,7 @@ mod tests {
         let app = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: InMemoryConnectionManager::default(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         });
 
         let create_response = app
@@ -1040,6 +1313,7 @@ mod tests {
         let app = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
             connection_manager: manager.clone(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         });
 
         let create_response = app
@@ -1107,6 +1381,7 @@ mod tests {
                 }],
             },
             connection_manager: InMemoryConnectionManager::default(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
         });
 
         let list_response = app

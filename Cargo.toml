@@ -16,6 +16,7 @@ axum = "0.7"
 clap = { version = "4", features = ["derive", "env"] }
 serialport = "4"
 serde = { version = "1", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 serde_json = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["full", "test-util"] }

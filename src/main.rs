@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
 use serialport_api::{
@@ -8,11 +8,12 @@ use serialport_api::{
         EnvServeConfig,
     },
     serial::{
-        manager::{ConnectionManagerWithTransport, SystemPortLister},
+        manager::{ConnectionManagerWithTransport, InMemoryConnectionManager, SystemPortLister},
         mock_device::{MockDeviceResponder, MockResponseScript},
         real_transport::SystemRealSerialConnectionManager,
         transport::MockSerialTransport,
     },
+    storage::{sqlite::SqlitePresetStore, InMemoryPresetStore, PresetStore},
 };
 
 #[derive(Debug, Parser)]
@@ -46,6 +47,9 @@ struct ServeArgs {
 
     #[arg(long)]
     real_serial: bool,
+
+    #[arg(long)]
+    preset_db: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -77,6 +81,10 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = resolved.to_string().parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let preset_store: Arc<dyn PresetStore> = match &resolved.preset_db {
+        Some(path) => Arc::new(SqlitePresetStore::open(path)?),
+        None => Arc::new(InMemoryPresetStore::default()),
+    };
 
     tracing::info!(
         %addr,
@@ -85,13 +93,15 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         default_port = ?resolved.serial_defaults.default_port,
         default_baud_rate = resolved.serial_defaults.default_baud_rate,
         default_delimiter = ?resolved.serial_defaults.default_delimiter,
+        preset_db = ?resolved.preset_db,
         "listening"
     );
 
     let app = if resolved.real_serial {
-        routes::router_with_state(routes::AppState::new(
+        routes::router_with_state(routes::AppState::with_preset_store_arc(
             SystemPortLister,
             SystemRealSerialConnectionManager::default(),
+            preset_store.clone(),
         ))
     } else if resolved.mock_device {
         let script = match &resolved.mock_script {
@@ -105,9 +115,17 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             MockSerialTransport::default(),
             MockDeviceResponder::from_script(script),
         );
-        routes::router_with_state(routes::AppState::new(SystemPortLister, manager))
+        routes::router_with_state(routes::AppState::with_preset_store_arc(
+            SystemPortLister,
+            manager,
+            preset_store.clone(),
+        ))
     } else {
-        routes::router()
+        routes::router_with_state(routes::AppState::with_preset_store_arc(
+            SystemPortLister,
+            InMemoryConnectionManager::default(),
+            preset_store.clone(),
+        ))
     };
 
     axum::serve(listener, app).await?;
@@ -123,6 +141,7 @@ impl From<ServeArgs> for CliServeOverrides {
             mock_device: args.mock_device,
             mock_script: args.mock_script,
             real_serial: args.real_serial,
+            preset_db: args.preset_db,
         }
     }
 }
@@ -196,6 +215,21 @@ mod tests {
         assert!(args.real_serial);
         assert!(!args.mock_device);
         assert!(args.mock_script.is_none());
+    }
+
+    #[test]
+    fn serve_cli_accepts_preset_db() {
+        let cli = Cli::parse_from([
+            "serialport-api",
+            "serve",
+            "--preset-db",
+            "./serialport-api.db",
+        ]);
+
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.preset_db, Some(PathBuf::from("./serialport-api.db")));
     }
 
     #[test]
