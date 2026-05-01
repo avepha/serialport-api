@@ -370,6 +370,10 @@ where
     fn events(&self) -> Result<Vec<SerialStreamEvent>> {
         self.inner.events()
     }
+
+    fn subscribe_events(&self) -> Result<tokio::sync::broadcast::Receiver<SerialStreamEvent>> {
+        self.inner.subscribe_events()
+    }
 }
 
 pub type SystemRealSerialConnectionManager = RealSerialConnectionManager<SystemSerialPortFactory>;

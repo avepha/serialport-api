@@ -23,6 +23,8 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::broadcast;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
 use crate::serial::manager::{
     list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
@@ -358,16 +360,16 @@ where
     L: SerialPortLister,
     C: ConnectionManager,
 {
+    let receiver = state
+        .connection_manager
+        .subscribe_events()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let events = state
         .connection_manager
         .events()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let stream = tokio_stream::iter(events.into_iter().map(|serial_event| {
-        Event::default()
-            .event(serial_event.event)
-            .json_data(serial_event.data)
-    }));
+    let stream = live_event_stream(events, receiver).map(serial_event_to_sse_event);
 
     Ok(Sse::new(stream))
 }
@@ -380,12 +382,16 @@ where
     L: SerialPortLister,
     C: ConnectionManager,
 {
+    let receiver = state
+        .connection_manager
+        .subscribe_events()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let events = state
         .connection_manager
         .events()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(ws.on_upgrade(move |socket| send_event_snapshot(socket, events)))
+    Ok(ws.on_upgrade(move |socket| send_live_events(socket, events, receiver)))
 }
 
 async fn socket_io_events<L, C>(
@@ -403,34 +409,100 @@ where
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let receiver = state
+        .connection_manager
+        .subscribe_events()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let events = state
         .connection_manager
         .events()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(ws.on_upgrade(move |socket| send_socket_io_event_snapshot(socket, events)))
+    Ok(ws.on_upgrade(move |socket| send_socket_io_live_events(socket, events, receiver)))
 }
 
-async fn send_event_snapshot(mut socket: WebSocket, events: Vec<SerialStreamEvent>) {
-    for serial_event in events {
-        let payload = json!({
-            "event": serial_event.event,
-            "data": serial_event.data,
-        });
+fn live_event_stream(
+    snapshot: Vec<SerialStreamEvent>,
+    receiver: broadcast::Receiver<SerialStreamEvent>,
+) -> impl tokio_stream::Stream<Item = SerialStreamEvent> {
+    let snapshot = tokio_stream::iter(snapshot);
+    let live = BroadcastStream::new(receiver).filter_map(|result| match result {
+        Ok(event) => Some(event),
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(count)) => {
+            Some(SerialStreamEvent {
+                event: "serial.error",
+                data: json!(format!("serial event stream lagged by {count} events")),
+            })
+        }
+    });
 
-        let Ok(text) = serde_json::to_string(&payload) else {
+    snapshot.chain(live)
+}
+
+fn serial_event_to_sse_event(
+    serial_event: SerialStreamEvent,
+) -> std::result::Result<Event, axum::Error> {
+    Event::default()
+        .event(serial_event.event)
+        .json_data(serial_event.data)
+}
+
+fn serial_event_to_ws_text(serial_event: SerialStreamEvent) -> Option<String> {
+    let payload = json!({
+        "event": serial_event.event,
+        "data": serial_event.data,
+    });
+    serde_json::to_string(&payload).ok()
+}
+
+fn serial_event_to_socket_io_frame(serial_event: SerialStreamEvent) -> Option<String> {
+    let payload = json!([serial_event.event, serial_event.data]);
+    serde_json::to_string(&payload)
+        .ok()
+        .map(|text| format!("42{text}"))
+}
+
+async fn send_live_events(
+    mut socket: WebSocket,
+    events: Vec<SerialStreamEvent>,
+    mut receiver: broadcast::Receiver<SerialStreamEvent>,
+) {
+    for serial_event in events {
+        let Some(text) = serial_event_to_ws_text(serial_event) else {
             break;
         };
 
         if socket.send(Message::Text(text)).await.is_err() {
-            break;
+            return;
         }
     }
 
-    let _ = socket.close().await;
+    loop {
+        tokio::select! {
+            result = receiver.recv() => match result {
+                Ok(serial_event) => {
+                    let Some(text) = serial_event_to_ws_text(serial_event) else { continue; };
+                    if socket.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            message = socket.recv() => match message {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => break,
+            },
+        }
+    }
 }
 
-async fn send_socket_io_event_snapshot(mut socket: WebSocket, events: Vec<SerialStreamEvent>) {
+async fn send_socket_io_live_events(
+    mut socket: WebSocket,
+    events: Vec<SerialStreamEvent>,
+    mut receiver: broadcast::Receiver<SerialStreamEvent>,
+) {
     let open_payload = json!({
         "sid": next_socket_io_sid(),
         "upgrades": [],
@@ -457,21 +529,34 @@ async fn send_socket_io_event_snapshot(mut socket: WebSocket, events: Vec<Serial
     }
 
     for serial_event in events {
-        let payload = json!([serial_event.event, serial_event.data]);
-        let Ok(text) = serde_json::to_string(&payload) else {
+        let Some(text) = serial_event_to_socket_io_frame(serial_event) else {
             break;
         };
 
-        if socket
-            .send(Message::Text(format!("42{text}")))
-            .await
-            .is_err()
-        {
-            break;
+        if socket.send(Message::Text(text)).await.is_err() {
+            return;
         }
     }
 
-    let _ = socket.close().await;
+    loop {
+        tokio::select! {
+            result = receiver.recv() => match result {
+                Ok(serial_event) => {
+                    let Some(text) = serial_event_to_socket_io_frame(serial_event) else { continue; };
+                    if socket.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            message = socket.recv() => match message {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => break,
+            },
+        }
+    }
 }
 
 fn next_socket_io_sid() -> String {
@@ -1491,13 +1576,21 @@ mod tests {
             Some("text/event-stream")
         );
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = std::str::from_utf8(&body).unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let mut text = String::new();
+        while !text.contains("event: serial.text") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
 
-        assert!(body.contains("event: serial.json"));
-        assert!(body.contains("data: {\"ok\":true,\"reqId\":\"1\"}"));
-        assert!(body.contains("event: serial.text"));
-        assert!(body.contains("data: \"hello robot\""));
+        assert!(text.contains("event: serial.json"));
+        assert!(text.contains("data: {\"ok\":true,\"reqId\":\"1\"}"));
+        assert!(text.contains("event: serial.text"));
+        assert!(text.contains("data: \"hello robot\""));
     }
 
     #[tokio::test]
@@ -1533,13 +1626,74 @@ mod tests {
             Some("text/event-stream")
         );
 
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = std::str::from_utf8(&body).unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let mut text = String::new();
+        while !text.contains("event: serial.text") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
 
-        assert!(body.contains("event: serial.json"));
-        assert!(body.contains("data: {\"ok\":true,\"reqId\":\"1\"}"));
-        assert!(body.contains("event: serial.text"));
-        assert!(body.contains("data: \"hello robot\""));
+        assert!(text.contains("event: serial.json"));
+        assert!(text.contains("data: {\"ok\":true,\"reqId\":\"1\"}"));
+        assert!(text.contains("event: serial.text"));
+        assert!(text.contains("data: \"hello robot\""));
+    }
+
+    #[tokio::test]
+    async fn events_route_replays_snapshot_and_streams_live_serial_events() {
+        let manager = InMemoryConnectionManager::default();
+        manager.record_event(crate::protocol::SerialEvent::Text("snapshot".to_string()));
+        let response = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: manager.clone(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
+            dashboard_assets: default_dashboard_assets_dir(),
+        })
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let snapshot = std::str::from_utf8(&snapshot).unwrap();
+        assert!(snapshot.contains("event: serial.text"));
+        assert!(snapshot.contains("data: \"snapshot\""));
+
+        manager.record_event(crate::protocol::SerialEvent::Json(json!({
+            "reqId": "live-1",
+            "ok": true
+        })));
+
+        let live = tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let live = std::str::from_utf8(&live).unwrap();
+        assert!(live.contains("event: serial.json"));
+        assert!(live.contains("data: {\"ok\":true,\"reqId\":\"live-1\"}"));
     }
 
     #[tokio::test]
@@ -1555,7 +1709,7 @@ mod tests {
 
         let app = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
-            connection_manager: manager,
+            connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
         });
@@ -1590,6 +1744,17 @@ mod tests {
             json!({"event":"serial.text","data":"hello robot"})
         );
 
+        manager.record_event(crate::protocol::SerialEvent::Text("live robot".to_string()));
+        let live = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(live.to_text().unwrap()).unwrap(),
+            json!({"event":"serial.text","data":"live robot"})
+        );
+
         server.abort();
     }
 
@@ -1606,7 +1771,7 @@ mod tests {
 
         let app = router_with_state(AppState {
             port_lister: MockPortLister { ports: Vec::new() },
-            connection_manager: manager,
+            connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
         });
@@ -1642,11 +1807,6 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        let close = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
 
         let open_text = open.to_text().unwrap();
         assert!(open_text.starts_with('0'));
@@ -1668,7 +1828,17 @@ mod tests {
             second_event.to_text().unwrap(),
             json!(["serial.text", "hello robot"]),
         );
-        assert!(close.is_close());
+
+        manager.record_event(crate::protocol::SerialEvent::Text("live robot".to_string()));
+        let live_event = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_socket_io_event_frame(
+            live_event.to_text().unwrap(),
+            json!(["serial.text", "live robot"]),
+        );
 
         server.abort();
     }

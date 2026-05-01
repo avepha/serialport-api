@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serialport::{SerialPortInfo, SerialPortType};
+use tokio::sync::broadcast;
 
 use crate::error::{Result, SerialportApiError};
 use crate::serial::mock_device::MockDeviceResponder;
@@ -53,12 +54,14 @@ pub struct SerialStreamEvent {
 }
 
 type ResponseQueue = BTreeMap<String, BTreeMap<String, VecDeque<Value>>>;
+const EVENT_BROADCAST_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct ConnectionManagerWithTransport<T> {
     connections: Arc<Mutex<BTreeMap<String, ConnectionInfo>>>,
     next_req_id: Arc<Mutex<u64>>,
     events: Arc<Mutex<Vec<SerialStreamEvent>>>,
+    event_tx: broadcast::Sender<SerialStreamEvent>,
     responses_by_connection_and_req_id: Arc<Mutex<ResponseQueue>>,
     transport: T,
     mock_responder: Option<MockDeviceResponder>,
@@ -73,6 +76,7 @@ pub trait ConnectionManager: Clone + Send + Sync + 'static {
     fn send_command(&self, connection_name: &str, payload: Value) -> Result<QueuedCommand>;
     fn take_response(&self, connection_name: &str, req_id: &str) -> Result<Option<Value>>;
     fn events(&self) -> Result<Vec<SerialStreamEvent>>;
+    fn subscribe_events(&self) -> Result<broadcast::Receiver<SerialStreamEvent>>;
 }
 
 impl<T> ConnectionManagerWithTransport<T>
@@ -80,10 +84,12 @@ where
     T: SerialTransport,
 {
     pub fn new(transport: T) -> Self {
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         Self {
             connections: Arc::default(),
             next_req_id: Arc::default(),
             events: Arc::default(),
+            event_tx,
             responses_by_connection_and_req_id: Arc::default(),
             transport,
             mock_responder: None,
@@ -91,10 +97,12 @@ where
     }
 
     pub fn with_mock_responder(transport: T, responder: MockDeviceResponder) -> Self {
+        let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         Self {
             connections: Arc::default(),
             next_req_id: Arc::default(),
             events: Arc::default(),
+            event_tx,
             responses_by_connection_and_req_id: Arc::default(),
             transport,
             mock_responder: Some(responder),
@@ -131,7 +139,8 @@ where
         self.events
             .lock()
             .expect("in-memory serial events lock poisoned")
-            .push(event);
+            .push(event.clone());
+        let _ = self.event_tx.send(event);
     }
 
     pub fn take_response(&self, connection_name: &str, req_id: &str) -> Result<Option<Value>> {
@@ -159,13 +168,15 @@ where
     }
 
     pub fn record_error(&self, message: impl Into<String>) {
+        let event = SerialStreamEvent {
+            event: "serial.error",
+            data: Value::String(message.into()),
+        };
         self.events
             .lock()
             .expect("in-memory serial events lock poisoned")
-            .push(SerialStreamEvent {
-                event: "serial.error",
-                data: Value::String(message.into()),
-            });
+            .push(event.clone());
+        let _ = self.event_tx.send(event);
     }
 }
 
@@ -303,6 +314,10 @@ where
             .lock()
             .expect("in-memory serial events lock poisoned")
             .clone())
+    }
+
+    fn subscribe_events(&self) -> Result<broadcast::Receiver<SerialStreamEvent>> {
+        Ok(self.event_tx.subscribe())
     }
 }
 
@@ -621,6 +636,74 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn manager_broadcasts_events_recorded_after_subscription() {
+        let manager = InMemoryConnectionManager::default();
+        let mut receiver = manager.subscribe_events().unwrap();
+
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Json(serde_json::json!({"reqId":"live-1","ok":true})),
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event,
+            SerialStreamEvent {
+                event: "serial.json",
+                data: serde_json::json!({"reqId":"live-1","ok":true}),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_allows_multiple_live_event_subscribers() {
+        let manager = InMemoryConnectionManager::default();
+        let mut first = manager.subscribe_events().unwrap();
+        let mut second = manager.subscribe_events().unwrap();
+
+        manager.record_event(crate::protocol::SerialEvent::Text(
+            "hello subscribers".to_string(),
+        ));
+
+        let expected = SerialStreamEvent {
+            event: "serial.text",
+            data: serde_json::json!("hello subscribers"),
+        };
+        assert_eq!(first.recv().await.unwrap(), expected);
+        assert_eq!(second.recv().await.unwrap(), expected);
+    }
+
+    #[test]
+    fn manager_snapshot_events_still_return_recorded_history() {
+        let manager = InMemoryConnectionManager::default();
+        let _receiver = manager.subscribe_events().unwrap();
+
+        manager.record_event(crate::protocol::SerialEvent::Text("history".to_string()));
+
+        assert_eq!(
+            manager.events().unwrap(),
+            vec![SerialStreamEvent {
+                event: "serial.text",
+                data: serde_json::json!("history"),
+            }]
+        );
+    }
+
+    #[test]
+    fn manager_records_events_without_live_subscribers() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager.record_event(crate::protocol::SerialEvent::Text(
+            "no subscribers".to_string(),
+        ));
+
+        assert_eq!(manager.events().unwrap()[0].event, "serial.text");
     }
 
     #[test]
