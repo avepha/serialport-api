@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::{
@@ -13,7 +13,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use crate::serial::manager::{
     list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
@@ -162,6 +169,7 @@ where
         .route("/api/v1/health", get(health))
         .route("/api/v1/events", get(events::<L, C>))
         .route("/api/v1/events/ws", get(events_ws::<L, C>))
+        .route("/socket.io/", get(socket_io_events::<L, C>))
         .route("/api/v1/ports", get(ports::<L, C>))
         .route("/list", get(ports::<L, C>))
         .route(
@@ -247,6 +255,29 @@ where
     Ok(ws.on_upgrade(move |socket| send_event_snapshot(socket, events)))
 }
 
+async fn socket_io_events<L, C>(
+    State(state): State<AppState<L, C>>,
+    Query(query): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, StatusCode>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    if query.get("EIO").map(String::as_str) != Some("4")
+        || query.get("transport").map(String::as_str) != Some("websocket")
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let events = state
+        .connection_manager
+        .events()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(ws.on_upgrade(move |socket| send_socket_io_event_snapshot(socket, events)))
+}
+
 async fn send_event_snapshot(mut socket: WebSocket, events: Vec<SerialStreamEvent>) {
     for serial_event in events {
         let payload = json!({
@@ -264,6 +295,58 @@ async fn send_event_snapshot(mut socket: WebSocket, events: Vec<SerialStreamEven
     }
 
     let _ = socket.close().await;
+}
+
+async fn send_socket_io_event_snapshot(mut socket: WebSocket, events: Vec<SerialStreamEvent>) {
+    let open_payload = json!({
+        "sid": next_socket_io_sid(),
+        "upgrades": [],
+        "pingInterval": 25000,
+        "pingTimeout": 20000,
+        "maxPayload": 1000000,
+    });
+
+    let Ok(open_text) = serde_json::to_string(&open_payload) else {
+        let _ = socket.close().await;
+        return;
+    };
+
+    if socket
+        .send(Message::Text(format!("0{open_text}")))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    if socket.send(Message::Text("40".to_string())).await.is_err() {
+        return;
+    }
+
+    for serial_event in events {
+        let payload = json!([serial_event.event, serial_event.data]);
+        let Ok(text) = serde_json::to_string(&payload) else {
+            break;
+        };
+
+        if socket
+            .send(Message::Text(format!("42{text}")))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    let _ = socket.close().await;
+}
+
+fn next_socket_io_sid() -> String {
+    static NEXT_SID: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "serialport-api-{}",
+        NEXT_SID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 async fn list_presets<L, C>(
@@ -1229,6 +1312,114 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn socket_io_streams_recorded_serial_events_as_engine_io_socket_io_frames() {
+        let manager = InMemoryConnectionManager::default();
+        manager.record_event(crate::protocol::SerialEvent::Json(json!({
+            "reqId": "1",
+            "ok": true
+        })));
+        manager.record_event(crate::protocol::SerialEvent::Text(
+            "hello robot".to_string(),
+        ));
+
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: manager,
+            preset_store: Arc::new(InMemoryPresetStore::default()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/socket.io/?EIO=4&transport=websocket"
+        ))
+        .await
+        .unwrap();
+
+        let open = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let connect = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let first_event = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second_event = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let close = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let open_text = open.to_text().unwrap();
+        assert!(open_text.starts_with('0'));
+        let open_payload: serde_json::Value = serde_json::from_str(&open_text[1..]).unwrap();
+        assert_eq!(open_payload["upgrades"], json!([]));
+        assert_eq!(open_payload["pingInterval"], json!(25000));
+        assert_eq!(open_payload["pingTimeout"], json!(20000));
+        assert_eq!(open_payload["maxPayload"], json!(1000000));
+        assert!(open_payload["sid"]
+            .as_str()
+            .is_some_and(|sid| !sid.is_empty()));
+
+        assert_eq!(connect.to_text().unwrap(), "40");
+        assert_socket_io_event_frame(
+            first_event.to_text().unwrap(),
+            json!(["serial.json", {"reqId":"1","ok":true}]),
+        );
+        assert_socket_io_event_frame(
+            second_event.to_text().unwrap(),
+            json!(["serial.text", "hello robot"]),
+        );
+        assert!(close.is_close());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn socket_io_rejects_unsupported_engine_io_query_params() {
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: InMemoryConnectionManager::default(),
+            preset_store: Arc::new(InMemoryPresetStore::default()),
+        });
+
+        for uri in [
+            "/socket.io/?EIO=3&transport=websocket",
+            "/socket.io/?EIO=4&transport=polling",
+            "/socket.io/?transport=websocket",
+            "/socket.io/?EIO=4",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    fn assert_socket_io_event_frame(frame: &str, expected_payload: serde_json::Value) {
+        assert!(frame.starts_with("42"));
+        let payload: serde_json::Value = serde_json::from_str(&frame[2..]).unwrap();
+        assert_eq!(payload, expected_payload);
     }
 
     #[tokio::test(start_paused = true)]

@@ -21,6 +21,7 @@ Implemented now:
 - [x] JSON command framing as UTF-8 JSON plus delimiter, usually `\r\n`
 - [x] Server-Sent Events endpoint for recorded mock serial events
 - [x] Native WebSocket endpoint for recorded serial event snapshots
+- [x] Minimal Socket.IO/Engine.IO v4 WebSocket compatibility endpoint for recorded serial event snapshots
 - [x] Legacy aliases: `/list`, `/connect`, `/disconnect`, `/info`, `/commit`
 - [x] Waited command responses matched by string `reqId`
 - [x] Opt-in mock-device/scripted responses for hardware-free response tests
@@ -37,7 +38,6 @@ Implemented now:
 
 Planned / not complete yet:
 
-- [ ] Socket.IO protocol compatibility, if needed by legacy/browser clients
 - [ ] ARM/Raspberry Pi release binary automation
 
 ## Install / build
@@ -179,6 +179,7 @@ Expected notes:
 - Command returns `status: queued` and a `reqId`.
 - Events returns SSE headers; a fresh server may have no event body.
 - The native WebSocket event endpoint is also available at `/api/v1/events/ws`; a fresh server may close without frames if no events have been recorded.
+- Minimal Socket.IO/Engine.IO clients can connect to `/socket.io/?EIO=4&transport=websocket` for the same recorded event snapshot; a fresh server may only send handshake frames before closing.
 - Disconnect returns `status: disconnected` for the requested name.
 
 ## HTTP API
@@ -367,6 +368,38 @@ Example text frames:
 
 A fresh server may have no recorded events, so the WebSocket can close without sending frames. This is a native WebSocket endpoint only; Socket.IO/Engine.IO clients are not compatible with `/api/v1/events/ws`.
 
+### `GET /socket.io/?EIO=4&transport=websocket`
+
+Open a minimal Socket.IO-compatible Engine.IO v4 WebSocket connection and receive the same recorded serial event snapshot used by `GET /api/v1/events` and `GET /api/v1/events/ws`. This endpoint exists for legacy/browser clients that require Engine.IO and Socket.IO packet framing.
+
+```bash
+websocat 'ws://127.0.0.1:4002/socket.io/?EIO=4&transport=websocket'
+```
+
+Frame sequence:
+
+- Engine.IO open packet: `0{"sid":"...","upgrades":[],"pingInterval":25000,"pingTimeout":20000,"maxPayload":1000000}`
+- Socket.IO default namespace connect packet: `40`
+- One Socket.IO event packet per recorded serial event, then a normal close
+
+Example event frames:
+
+```text
+42["serial.json",{"reqId":"1","ok":true}]
+```
+
+```text
+42["serial.text","hello robot"]
+```
+
+Compatibility scope and limitations:
+
+- Supports only `EIO=4` and `transport=websocket`; missing or unsupported values return HTTP `400` before upgrade.
+- Supports only the default namespace and server-to-client serial event packets.
+- Sends a snapshot of already recorded events and then closes normally; it is not a live fan-out bus.
+- Does not implement long polling, rooms, acknowledgements, binary attachments, middleware, authentication, command submission, or full Socket.IO server feature parity.
+- For new simple clients, `GET /api/v1/events` SSE or `GET /api/v1/events/ws` native WebSocket are still recommended.
+
 ## Saved command presets
 
 Preset routes store reusable JSON command payloads without opening serial ports or sending commands. By default, presets are in-memory and reset when the server exits. Use `--preset-db <PATH>` or `[storage] preset_db = "..."` to enable SQLite persistence.
@@ -529,10 +562,6 @@ Important source files:
 Near-term work:
 
 - Add ARM/Raspberry Pi binary release automation if maintainers want prebuilt Pi artifacts.
-
-Later work:
-
-- Socket.IO protocol compatibility if needed for legacy/browser clients that require Engine.IO framing.
 
 ## License
 

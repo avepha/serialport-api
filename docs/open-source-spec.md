@@ -326,7 +326,7 @@ Example event payload:
 }
 ```
 
-Native WebSocket snapshots are also available at `GET /events/ws`: the server sends JSON text frames shaped as `{ "event": "serial.json", "data": ... }` for the currently recorded event snapshot and then closes normally. Socket.IO/Engine.IO protocol compatibility remains separate future work; native WebSocket clients can use `/events/ws`, but Socket.IO clients cannot.
+Native WebSocket snapshots are also available at `GET /events/ws`: the server sends JSON text frames shaped as `{ "event": "serial.json", "data": ... }` for the currently recorded event snapshot and then closes normally. Minimal Socket.IO/Engine.IO v4 WebSocket compatibility is available at `GET /socket.io/?EIO=4&transport=websocket`: the server sends an Engine.IO open packet, Socket.IO default namespace connect packet, then event packets shaped as `42["serial.json", ...]` for the recorded event snapshot before closing. Full Socket.IO feature parity (long polling, rooms, acknowledgements, binary payloads, multiple namespaces, or command submission) is intentionally out of scope.
 
 ## CLI
 
