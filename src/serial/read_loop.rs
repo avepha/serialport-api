@@ -177,16 +177,16 @@ pub fn spawn_real_read_loop<M, R>(
     connection_name: String,
     delimiter: String,
     stop: RealReadLoopStop,
-) -> tokio::task::JoinHandle<()>
+) -> std::thread::JoinHandle<()>
 where
     M: SerialEventRecorder,
     R: RealSerialLineSource,
 {
-    tokio::spawn(async move {
+    std::thread::spawn(move || {
         while !stop.is_stopped() {
             match drain_real_serial_lines(&manager, &read_source, &connection_name, &delimiter) {
-                Ok(0) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-                Ok(_) => tokio::task::yield_now().await,
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Ok(_) => std::thread::yield_now(),
                 Err(error) => {
                     if matches!(
                         error,
@@ -195,7 +195,7 @@ where
                         break;
                     }
                     manager.record_serial_error_for_connection(&connection_name, error.to_string());
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
         }
@@ -340,7 +340,7 @@ mod tests {
         .unwrap();
 
         stop.stop();
-        handle.await.unwrap();
+        handle.join().unwrap();
     }
 
     #[test]

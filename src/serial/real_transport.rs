@@ -12,6 +12,7 @@ use crate::serial::read_loop::{spawn_real_read_loop, RealReadLoopStop};
 use crate::serial::transport::SerialTransport;
 
 pub const DEFAULT_SERIAL_TIMEOUT_MS: u64 = 50;
+const MAX_BYTES_PER_DRAIN: usize = 8192;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SerialOpenSettings {
@@ -89,7 +90,9 @@ where
 
     pub fn drain_lines(&self, connection_name: &str, delimiter: &str) -> Result<Vec<Vec<u8>>> {
         if delimiter.is_empty() {
-            return Ok(Vec::new());
+            return Err(SerialportApiError::InvalidConnectionRequest(
+                "delimiter must not be empty".to_string(),
+            ));
         }
 
         let handle = self
@@ -101,7 +104,7 @@ where
             .ok_or_else(|| SerialportApiError::ConnectionNotFound(connection_name.to_string()))?;
 
         let mut newly_read = Vec::new();
-        loop {
+        for _ in 0..MAX_BYTES_PER_DRAIN {
             let read = handle
                 .lock()
                 .expect("real serial handle lock poisoned")
@@ -135,6 +138,12 @@ where
     F: SerialPortFactory,
 {
     fn open(&self, connection: &ConnectionInfo) -> Result<()> {
+        if connection.delimiter.is_empty() {
+            return Err(SerialportApiError::InvalidConnectionRequest(
+                "delimiter must not be empty".to_string(),
+            ));
+        }
+
         let handle = self.factory.open(connection)?;
         self.handles
             .lock()
@@ -241,7 +250,12 @@ where
     F: SerialPortFactory,
 {
     inner: ConnectionManagerWithTransport<RealSerialTransport<F>>,
-    stops_by_connection: Arc<Mutex<BTreeMap<String, RealReadLoopStop>>>,
+    loops_by_connection: Arc<Mutex<BTreeMap<String, RealReadLoopTask>>>,
+}
+
+struct RealReadLoopTask {
+    stop: RealReadLoopStop,
+    handle: std::thread::JoinHandle<()>,
 }
 
 impl<F> Clone for RealSerialConnectionManager<F>
@@ -251,7 +265,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            stops_by_connection: self.stops_by_connection.clone(),
+            loops_by_connection: self.loops_by_connection.clone(),
         }
     }
 }
@@ -263,12 +277,19 @@ where
     pub fn new(transport: RealSerialTransport<F>) -> Self {
         Self {
             inner: ConnectionManagerWithTransport::new(transport),
-            stops_by_connection: Arc::default(),
+            loops_by_connection: Arc::default(),
         }
     }
 
     pub fn inner(&self) -> ConnectionManagerWithTransport<RealSerialTransport<F>> {
         self.inner.clone()
+    }
+
+    fn take_read_loop_for(&self, name: &str) -> Option<RealReadLoopTask> {
+        self.loops_by_connection
+            .lock()
+            .expect("real read-loop registry lock poisoned")
+            .remove(name)
     }
 }
 
@@ -277,20 +298,34 @@ where
     F: SerialPortFactory,
 {
     fn connect(&self, request: ConnectionRequest) -> Result<ConnectionInfo> {
+        if request.delimiter.is_empty() {
+            return Err(SerialportApiError::InvalidConnectionRequest(
+                "delimiter must not be empty".to_string(),
+            ));
+        }
+
+        if let Some(loop_task) = self.take_read_loop_for(&request.name) {
+            loop_task.stop.stop();
+            let _ = self.inner.disconnect(&request.name);
+            let _ = loop_task.handle.join();
+        } else {
+            let _ = self.inner.disconnect(&request.name);
+        }
+
         let connection = self.inner.connect(request)?;
         let stop = RealReadLoopStop::new();
-        self.stops_by_connection
-            .lock()
-            .expect("real read-loop stop registry lock poisoned")
-            .insert(connection.name.clone(), stop.clone());
-
-        spawn_real_read_loop(
+        let handle = spawn_real_read_loop(
             self.inner.clone(),
             self.inner.transport(),
             connection.name.clone(),
             connection.delimiter.clone(),
-            stop,
+            stop.clone(),
         );
+
+        self.loops_by_connection
+            .lock()
+            .expect("real read-loop registry lock poisoned")
+            .insert(connection.name.clone(), RealReadLoopTask { stop, handle });
 
         Ok(connection)
     }
@@ -300,15 +335,20 @@ where
     }
 
     fn disconnect(&self, name: &str) -> Result<String> {
-        if let Some(stop) = self
-            .stops_by_connection
+        let loop_task = self
+            .loops_by_connection
             .lock()
-            .expect("real read-loop stop registry lock poisoned")
-            .remove(name)
-        {
-            stop.stop();
+            .expect("real read-loop registry lock poisoned")
+            .remove(name);
+
+        if let Some(loop_task) = loop_task {
+            loop_task.stop.stop();
+            let result = self.inner.disconnect(name);
+            let _ = loop_task.handle.join();
+            result
+        } else {
+            self.inner.disconnect(name)
         }
-        self.inner.disconnect(name)
     }
 
     fn send_command(
@@ -348,6 +388,7 @@ mod tests {
 
     use super::*;
     use crate::error::SerialportApiError;
+    use crate::serial::manager::ConnectionManager;
 
     #[derive(Clone, Default)]
     struct FakeSerialPortFactory {
@@ -529,5 +570,106 @@ mod tests {
             transport.drain_lines("default", "\r\n").unwrap(),
             vec![b"hello robot\r\n".to_vec()]
         );
+    }
+
+    #[test]
+    fn real_transport_rejects_empty_delimiter() {
+        let transport = RealSerialTransport::new(FakeSerialPortFactory::default());
+        let mut connection = connection();
+        connection.delimiter.clear();
+
+        let error = transport.open(&connection).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SerialportApiError::InvalidConnectionRequest(message)
+                if message.contains("delimiter")
+        ));
+    }
+
+    #[tokio::test]
+    async fn real_manager_writes_reads_and_satisfies_waited_response_with_fake_handle() {
+        let factory = FakeSerialPortFactory::default();
+        let manager = RealSerialConnectionManager::new(RealSerialTransport::new(factory.clone()));
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ttyTEST0".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+
+        let queued = manager
+            .send_command(
+                "default",
+                serde_json::json!({"reqId":"fake-route-1","method":"query","topic":"ping","data":{}}),
+            )
+            .unwrap();
+        assert_eq!(queued.req_id, "fake-route-1");
+        let written = factory.written_for("default");
+        assert!(written.ends_with(b"\r\n"));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&written[..written.len() - 2]).unwrap();
+        assert_eq!(payload["reqId"], "fake-route-1");
+        assert_eq!(payload["topic"], "ping");
+        assert_eq!(factory.flush_count_for("default"), 1);
+
+        factory.push_bytes("default", b"{\"reqId\":\"fake-route-1\",\"ok\":true}\r\n");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if manager
+                    .take_response("default", "fake-route-1")
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        manager.disconnect("default").unwrap();
+    }
+
+    #[test]
+    fn real_manager_reconnect_replaces_single_read_loop_and_disconnect_joins_it() {
+        let factory = FakeSerialPortFactory::default();
+        let manager = RealSerialConnectionManager::new(RealSerialTransport::new(factory.clone()));
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ttyTEST0".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+        assert_eq!(manager.loops_by_connection.lock().unwrap().len(), 1);
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ttyTEST1".to_string(),
+                baud_rate: 57600,
+                delimiter: "\n".to_string(),
+            })
+            .unwrap();
+        assert_eq!(manager.loops_by_connection.lock().unwrap().len(), 1);
+        assert_eq!(
+            factory.opened_ports(),
+            vec![
+                ("/dev/ttyTEST0".to_string(), 115200),
+                ("/dev/ttyTEST1".to_string(), 57600),
+            ]
+        );
+
+        manager.disconnect("default").unwrap();
+
+        assert_eq!(manager.loops_by_connection.lock().unwrap().len(), 0);
+        assert!(!manager.inner().transport().is_open("default"));
     }
 }

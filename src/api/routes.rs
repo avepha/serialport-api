@@ -355,6 +355,9 @@ mod tests {
     use crate::serial::manager::{
         ConnectionManagerWithTransport, InMemoryConnectionManager, PortInfo, SerialPortLister,
     };
+    use crate::serial::real_transport::{
+        RealSerialConnectionManager, RealSerialTransport, SerialPortFactory, SerialPortHandle,
+    };
 
     #[derive(Clone)]
     struct MockPortLister {
@@ -365,6 +368,176 @@ mod tests {
         fn available_ports(&self) -> Result<Vec<PortInfo>> {
             Ok(self.ports.clone())
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeSerialPortFactory {
+        state: std::sync::Arc<std::sync::Mutex<FakeFactoryState>>,
+    }
+
+    #[derive(Default)]
+    struct FakeFactoryState {
+        handles: std::collections::BTreeMap<String, FakeSerialPortHandle>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeSerialPortHandle {
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        flush_count: std::sync::Arc<std::sync::Mutex<usize>>,
+        readable: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
+    }
+
+    impl FakeSerialPortFactory {
+        fn push_bytes(&self, name: &str, bytes: &[u8]) {
+            self.state
+                .lock()
+                .expect("fake factory lock poisoned")
+                .handles
+                .get(name)
+                .expect("expected fake handle")
+                .readable
+                .lock()
+                .expect("fake readable lock poisoned")
+                .extend(bytes.iter().copied());
+        }
+
+        fn written_for(&self, name: &str) -> Vec<u8> {
+            self.state
+                .lock()
+                .expect("fake factory lock poisoned")
+                .handles
+                .get(name)
+                .expect("expected fake handle")
+                .written
+                .lock()
+                .expect("fake written lock poisoned")
+                .clone()
+        }
+
+        fn flush_count_for(&self, name: &str) -> usize {
+            *self
+                .state
+                .lock()
+                .expect("fake factory lock poisoned")
+                .handles
+                .get(name)
+                .expect("expected fake handle")
+                .flush_count
+                .lock()
+                .expect("fake flush lock poisoned")
+        }
+    }
+
+    impl SerialPortFactory for FakeSerialPortFactory {
+        type Handle = FakeSerialPortHandle;
+
+        fn open(&self, connection: &ConnectionInfo) -> Result<Self::Handle> {
+            let handle = FakeSerialPortHandle::default();
+            self.state
+                .lock()
+                .expect("fake factory lock poisoned")
+                .handles
+                .insert(connection.name.clone(), handle.clone());
+            Ok(handle)
+        }
+    }
+
+    impl SerialPortHandle for FakeSerialPortHandle {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.written
+                .lock()
+                .expect("fake written lock poisoned")
+                .extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            *self.flush_count.lock().expect("fake flush lock poisoned") += 1;
+            Ok(())
+        }
+
+        fn read_byte(&mut self) -> std::io::Result<Option<u8>> {
+            Ok(self
+                .readable
+                .lock()
+                .expect("fake readable lock poisoned")
+                .pop_front())
+        }
+    }
+
+    #[tokio::test]
+    async fn real_mode_routes_write_flush_and_wait_for_fake_serial_response() {
+        let factory = FakeSerialPortFactory::default();
+        let manager = RealSerialConnectionManager::new(RealSerialTransport::new(factory.clone()));
+        let app = router_with_state(AppState::new(
+            MockPortLister { ports: Vec::new() },
+            manager.clone(),
+        ));
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/FAKE","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let request = tokio::spawn(app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/connections/default/commands")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload":{"reqId":"real-route-1","method":"query","topic":"ping","data":{}},"waitForResponse":true,"timeoutMs":1000}"#,
+                ))
+                .unwrap(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if factory.flush_count_for("default") == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(!factory.written_for("default").is_empty());
+        factory.push_bytes("default", b"{\"reqId\":\"real-route-1\",\"ok\":true}\r\n");
+
+        let response = request.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "status": "ok",
+                "reqId": "real-route-1",
+                "response": {"reqId":"real-route-1","ok":true}
+            })
+        );
+
+        let disconnect_response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/connections/default")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disconnect_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

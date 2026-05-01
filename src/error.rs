@@ -22,6 +22,9 @@ pub enum SerialportApiError {
 
     #[error("command timed out")]
     CommandTimeout,
+
+    #[error("invalid connection request: {0}")]
+    InvalidConnectionRequest(String),
 }
 
 pub type Result<T> = std::result::Result<T, SerialportApiError>;
