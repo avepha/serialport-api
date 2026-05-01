@@ -4,6 +4,7 @@
 //! HTTP API behavior into testable modules here.
 
 pub mod api;
+pub mod config;
 pub mod error;
 pub mod protocol;
 pub mod serial;

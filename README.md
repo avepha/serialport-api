@@ -4,7 +4,7 @@
 
 ## Status
 
-> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. An opt-in `--real-serial` mode can open OS serial ports and run read/write lifecycle handling. Preset storage and Raspberry Pi packaging are planned but not complete yet.
+> **Status: rewrite in progress.** The default API server remains mock/in-memory and hardware-free. Optional TOML config defaults and opt-in `--real-serial` mode are available. Preset storage and Raspberry Pi packaging are planned but not complete yet.
 
 Use the current default server to exercise the HTTP API shape, route compatibility, request/response JSON, command framing, and event-stream formatting without hardware. Use `serve --real-serial` only when you intentionally want to open and communicate with attached serial devices.
 
@@ -25,12 +25,12 @@ Implemented now:
 - [x] Opt-in mock-device/scripted responses for hardware-free response tests
 - [x] Opt-in real serial mode for opening/writing/reading OS serial ports
 - [x] Coordinated real serial read-loop lifecycle with hardware-free tests
+- [x] Optional TOML config file defaults for server and serial startup settings
 - [x] GitHub Actions CI for format, clippy, and tests
 - [x] Unit and route tests for current behavior
 
 Planned / not complete yet:
 
-- [ ] Config file support
 - [ ] SQLite saved presets
 - [ ] Raspberry Pi install guide and systemd service
 - [ ] Release binaries / Docker image
@@ -80,6 +80,39 @@ You can also configure the server with environment variables:
 ```bash
 SERIALPORT_API_HOST=127.0.0.1 SERIALPORT_API_PORT=4002 cargo run -- serve
 ```
+
+### Configuration file
+
+`serve` can load optional TOML defaults for server startup and future/default serial connection settings. Pass an explicit path with `--config`; if no path is passed, the server auto-loads `./serialport-api.toml` from the current working directory when that file exists. Missing auto-discovered config is non-fatal. Missing, unreadable, or invalid explicit config fails startup clearly.
+
+```bash
+cargo run -- serve --config ./serialport-api.toml
+```
+
+Example `serialport-api.toml`:
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 4002
+
+[serial]
+default_port = "/dev/ttyUSB0"
+default_baud_rate = 115200
+default_delimiter = "\r\n"
+real_serial = false
+mock_device = false
+mock_script = "./mock-responses.json"
+```
+
+Precedence is:
+
+1. Explicit CLI flags such as `--host`, `--port`, `--mock-device`, `--mock-script`, and `--real-serial`
+2. Environment variables `SERIALPORT_API_HOST` and `SERIALPORT_API_PORT`
+3. Config-file values
+4. Built-in defaults (`127.0.0.1:4002`, mock/in-memory mode, baud `115200`, delimiter `\r\n`)
+
+`mock_script` implies mock-device behavior. The server rejects a resolved configuration that combines real serial mode with mock-device or mock-script mode.
 
 ## Quick start
 
@@ -410,7 +443,6 @@ Important source files:
 
 Near-term work:
 
-- Add config file support for server and serial defaults.
 - Add persistent saved connection profiles/presets.
 
 Later work:
