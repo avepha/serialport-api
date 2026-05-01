@@ -37,10 +37,6 @@ Implemented now:
 - [x] GitHub Actions CI for format, clippy, and tests
 - [x] Unit and route tests for current behavior
 
-Planned / not complete yet:
-
-- [ ] ARMv7 / 32-bit Raspberry Pi release artifacts, if maintainers want a verified 32-bit target
-
 ## Install / build
 
 Prerequisites:
@@ -434,7 +430,7 @@ Release binary archives are named `serialport-api-${TAG}-${TARGET}.tar.gz` with 
 - `x86_64-unknown-linux-gnu` for Linux desktops/servers.
 - `aarch64-unknown-linux-gnu` for 64-bit Raspberry Pi OS / ARM64 Linux.
 
-Use `sha256sum -c` against the downloaded checksum file before installing a binary. See the Docker/release guide and the [Raspberry Pi/systemd deployment guide](docs/raspberry-pi-systemd.md) for detailed artifact selection and install commands. ARMv7 / 32-bit Raspberry Pi release artifacts are not currently published; build from source on those systems.
+Use `sha256sum -c` against the downloaded checksum file before installing a binary. See the Docker/release guide and the [Raspberry Pi/systemd deployment guide](docs/raspberry-pi-systemd.md) for detailed artifact selection and install commands. ARMv7 / 32-bit Raspberry Pi release artifacts are optional and not currently published; 32-bit Pi OS users should build from source unless maintainers request and verify a dedicated `armv7-unknown-linux-gnueabihf` release target.
 
 ## Raspberry Pi / systemd deployment
 
@@ -564,12 +560,6 @@ Important source files:
 - `src/error.rs` — shared error type
 - `docs/implementation-plan.md` — staged rewrite plan
 - `docs/open-source-spec.md` — long-form target specification
-
-## Roadmap
-
-Near-term work:
-
-- Add ARMv7 / 32-bit Raspberry Pi release artifacts only if maintainers need them and the target can be verified reliably.
 
 ## License
 
