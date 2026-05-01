@@ -80,6 +80,7 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let addr: SocketAddr = resolved.to_string().parse()?;
+    let dashboard_status = routes::DashboardStatusResponse::from_resolved_config(&resolved);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let preset_store: Arc<dyn PresetStore> = match &resolved.preset_db {
         Some(path) => Arc::new(SqlitePresetStore::open(path)?),
@@ -98,11 +99,14 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let app = if resolved.real_serial {
-        routes::router_with_state(routes::AppState::with_preset_store_arc(
-            SystemPortLister,
-            SystemRealSerialConnectionManager::default(),
-            preset_store.clone(),
-        ))
+        routes::router_with_state(
+            routes::AppState::with_preset_store_arc(
+                SystemPortLister,
+                SystemRealSerialConnectionManager::default(),
+                preset_store.clone(),
+            )
+            .with_dashboard_status(dashboard_status.clone()),
+        )
     } else if resolved.mock_device {
         let script = match &resolved.mock_script {
             Some(path) => {
@@ -115,17 +119,23 @@ async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             MockSerialTransport::default(),
             MockDeviceResponder::from_script(script),
         );
-        routes::router_with_state(routes::AppState::with_preset_store_arc(
-            SystemPortLister,
-            manager,
-            preset_store.clone(),
-        ))
+        routes::router_with_state(
+            routes::AppState::with_preset_store_arc(
+                SystemPortLister,
+                manager,
+                preset_store.clone(),
+            )
+            .with_dashboard_status(dashboard_status.clone()),
+        )
     } else {
-        routes::router_with_state(routes::AppState::with_preset_store_arc(
-            SystemPortLister,
-            InMemoryConnectionManager::default(),
-            preset_store.clone(),
-        ))
+        routes::router_with_state(
+            routes::AppState::with_preset_store_arc(
+                SystemPortLister,
+                InMemoryConnectionManager::default(),
+                preset_store.clone(),
+            )
+            .with_dashboard_status(dashboard_status.clone()),
+        )
     };
 
     axum::serve(listener, app).await?;

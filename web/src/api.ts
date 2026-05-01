@@ -1,4 +1,22 @@
 export type HealthResponse = { status: string; version: string };
+export type DashboardStatusResponse = {
+  server: { status: "ok" | string; version: string };
+  runtime: {
+    mode: "memory" | "mock" | "mock-script" | "real";
+    realSerial: boolean;
+    mockDevice: boolean;
+    mockScriptConfigured: boolean;
+  };
+  serialDefaults: {
+    defaultPortConfigured: boolean;
+    baudRate: number;
+    delimiter: string;
+  };
+  storage: {
+    presets: "memory" | "sqlite";
+    persistentPresets: boolean;
+  };
+};
 export type PortInfo = { name: string; type?: string; port_type?: string; manufacturer?: string | null; serial_number?: string | null };
 export type PortsResponse = { ports: PortInfo[] };
 export type ConnectionInfo = { name: string; status: string; port: string; baudRate: number; delimiter: string };
@@ -31,6 +49,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => requestJson<HealthResponse>("/api/v1/health"),
+  status: () => requestJson<DashboardStatusResponse>("/api/v1/status"),
   ports: () => requestJson<PortsResponse>("/api/v1/ports"),
   connections: () => requestJson<ConnectionsResponse>("/api/v1/connections"),
   connect: (body: ConnectRequest) => requestJson<ConnectResponse>("/api/v1/connections", { method: "POST", body: JSON.stringify(body) }),

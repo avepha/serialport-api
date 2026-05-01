@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Activity, Cable, CircleDot, Play, PlugZap, RefreshCw, Save, Send, Server, Trash2 } from "lucide-react";
-import { api, ConnectionInfo, HealthResponse, parseJsonObject, PortInfo, Preset } from "./api";
+import { api, ConnectionInfo, DashboardStatusResponse, HealthResponse, parseJsonObject, PortInfo, Preset } from "./api";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,8 @@ const defaultPayload = JSON.stringify({ method: "query", topic: "sensor.read", d
 
 function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [status, setStatus] = useState<DashboardStatusResponse | null>(null);
+  const [defaultsApplied, setDefaultsApplied] = useState(false);
   const [ports, setPorts] = useState<PortInfo[]>([]);
   const [connections, setConnections] = useState<ConnectionInfo[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
@@ -40,20 +42,40 @@ function App() {
   const refresh = async () => {
     setLoading(true);
     try {
-      const [healthResult, portsResult, connectionsResult, presetsResult] = await Promise.all([
+      const [healthResult, statusResult, portsResult, connectionsResult, presetsResult] = await Promise.all([
         api.health(),
+        api.status().catch((error) => {
+          setNotice({ tone: "error", message: `Status unavailable: ${errorMessage(error)}` });
+          return null;
+        }),
         api.ports(),
         api.connections(),
         api.presets(),
       ]);
       setHealth(healthResult);
+      setStatus(statusResult);
       setPorts(portsResult.ports);
       setConnections(connectionsResult.connections);
       setPresets(presetsResult.presets);
+      if (statusResult && !defaultsApplied) {
+        setConnectForm((current) => {
+          if (current.baudRate !== "115200" || current.delimiter !== "\\r\\n") {
+            return current;
+          }
+          return {
+            ...current,
+            baudRate: String(statusResult.serialDefaults.baudRate),
+            delimiter: encodeDelimiter(statusResult.serialDefaults.delimiter),
+          };
+        });
+        setDefaultsApplied(true);
+      }
       if (!selectedConnection && connectionsResult.connections[0]) {
         setSelectedConnection(connectionsResult.connections[0].name);
       }
-      setNotice({ tone: "ok", message: "Dashboard data refreshed" });
+      if (statusResult) {
+        setNotice({ tone: "ok", message: "Dashboard data refreshed" });
+      }
     } catch (error) {
       setNotice({ tone: "error", message: errorMessage(error) });
     } finally {
@@ -167,8 +189,10 @@ function App() {
           </Alert>
         )}
 
-        <section className="grid gap-4 md:grid-cols-3">
-          <StatusCard icon={<Server className="h-4 w-4" />} label="Server" value={health ? `${health.status} · v${health.version}` : "unknown"} />
+        <section className="grid gap-4 md:grid-cols-5">
+          <StatusCard icon={<Server className="h-4 w-4" />} label="Server" value={status ? `${status.server.status} · v${status.server.version}` : health ? `${health.status} · v${health.version}` : "unknown"} />
+          <StatusCard icon={<PlugZap className="h-4 w-4" />} label="Mode" value={status?.runtime.mode ?? "unknown"} />
+          <StatusCard icon={<Save className="h-4 w-4" />} label="Presets" value={status ? `${status.storage.presets}${status.storage.persistentPresets ? " · persistent" : ""}` : "unknown"} />
           <StatusCard icon={<Cable className="h-4 w-4" />} label="Ports" value={`${ports.length} visible`} />
           <StatusCard icon={<Activity className="h-4 w-4" />} label="EventSource" value={eventStatus} />
         </section>
@@ -177,7 +201,7 @@ function App() {
           <TabsList><TabsTrigger value="control">Control</TabsTrigger><TabsTrigger value="events">Events</TabsTrigger><TabsTrigger value="presets">Presets</TabsTrigger></TabsList>
           <TabsContent value="control" className="grid gap-4 lg:grid-cols-[0.95fr_1.05fr]">
             <Card>
-              <CardHeader><CardTitle>Connections</CardTitle><CardDescription>Create, inspect, and disconnect named serial sessions.</CardDescription></CardHeader>
+              <CardHeader><CardTitle>Connections</CardTitle><CardDescription>Create, inspect, and disconnect named serial sessions. {status ? `Defaults: ${status.serialDefaults.baudRate} baud, delimiter ${encodeDelimiter(status.serialDefaults.delimiter) || "empty"}, default port ${status.serialDefaults.defaultPortConfigured ? "configured" : "not configured"}.` : "Status defaults unavailable; manual values remain editable."}</CardDescription></CardHeader>
               <CardContent className="space-y-4">
                 <div className="grid gap-3 md:grid-cols-2">
                   <Field label="Name"><Input value={connectForm.name} onChange={(e) => setConnectForm({ ...connectForm, name: e.target.value })} /></Field>
@@ -249,6 +273,10 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function decodeDelimiter(value: string) {
   return value.replace(/\\r/g, "\r").replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+}
+
+function encodeDelimiter(value: string) {
+  return value.replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
 }
 
 function errorMessage(error: unknown) {

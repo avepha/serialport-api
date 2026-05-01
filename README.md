@@ -228,6 +228,39 @@ Response:
 {"status":"ok","version":"0.1.0"}
 ```
 
+### `GET /api/v1/status`
+
+Return dashboard-safe resolved runtime/configuration facts. This endpoint is intended for same-origin UI initialization and intentionally reduces sensitive settings to booleans/enums instead of exposing paths or host details.
+
+```bash
+curl -s http://127.0.0.1:4002/api/v1/status
+```
+
+Example response:
+
+```json
+{
+  "server": { "status": "ok", "version": "0.1.0" },
+  "runtime": {
+    "mode": "memory",
+    "realSerial": false,
+    "mockDevice": false,
+    "mockScriptConfigured": false
+  },
+  "serialDefaults": {
+    "defaultPortConfigured": false,
+    "baudRate": 115200,
+    "delimiter": "\r\n"
+  },
+  "storage": {
+    "presets": "memory",
+    "persistentPresets": false
+  }
+}
+```
+
+Privacy guardrails: the response omits server bind host/port, filesystem paths for config/mock scripts/dashboard assets/preset DBs, environment values, and the serial default port string. Use `GET /api/v1/ports` when a client explicitly needs serial port inventory.
+
 ### `GET /api/v1/ports`
 
 List serial ports visible to the operating system through the `serialport` crate.

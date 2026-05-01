@@ -26,6 +26,7 @@ use std::{
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
+use crate::config::{ResolvedServeConfig, DEFAULT_SERIAL_BAUD_RATE, DEFAULT_SERIAL_DELIMITER};
 use crate::serial::manager::{
     list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
     PortInfo, SerialPortLister, SerialStreamEvent, SystemPortLister,
@@ -36,6 +37,113 @@ use crate::storage::{CreatePreset, InMemoryPresetStore, Preset, PresetStore, Pre
 struct HealthResponse {
     status: &'static str,
     version: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardStatusResponse {
+    server: DashboardServerStatus,
+    runtime: DashboardRuntimeStatus,
+    #[serde(rename = "serialDefaults")]
+    serial_defaults: DashboardSerialDefaults,
+    storage: DashboardStorageStatus,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DashboardServerStatus {
+    status: &'static str,
+    version: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DashboardRuntimeStatus {
+    mode: &'static str,
+    #[serde(rename = "realSerial")]
+    real_serial: bool,
+    #[serde(rename = "mockDevice")]
+    mock_device: bool,
+    #[serde(rename = "mockScriptConfigured")]
+    mock_script_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DashboardSerialDefaults {
+    #[serde(rename = "defaultPortConfigured")]
+    default_port_configured: bool,
+    #[serde(rename = "baudRate")]
+    baud_rate: u32,
+    delimiter: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DashboardStorageStatus {
+    presets: &'static str,
+    #[serde(rename = "persistentPresets")]
+    persistent_presets: bool,
+}
+
+impl DashboardStatusResponse {
+    pub fn default_memory() -> Self {
+        Self {
+            server: DashboardServerStatus {
+                status: "ok",
+                version: env!("CARGO_PKG_VERSION"),
+            },
+            runtime: DashboardRuntimeStatus {
+                mode: "memory",
+                real_serial: false,
+                mock_device: false,
+                mock_script_configured: false,
+            },
+            serial_defaults: DashboardSerialDefaults {
+                default_port_configured: false,
+                baud_rate: DEFAULT_SERIAL_BAUD_RATE,
+                delimiter: DEFAULT_SERIAL_DELIMITER.to_string(),
+            },
+            storage: DashboardStorageStatus {
+                presets: "memory",
+                persistent_presets: false,
+            },
+        }
+    }
+
+    pub fn from_resolved_config(config: &ResolvedServeConfig) -> Self {
+        let mock_script_configured = config.mock_script.is_some();
+        let presets = if config.preset_db.is_some() {
+            "sqlite"
+        } else {
+            "memory"
+        };
+
+        Self {
+            server: DashboardServerStatus {
+                status: "ok",
+                version: env!("CARGO_PKG_VERSION"),
+            },
+            runtime: DashboardRuntimeStatus {
+                mode: if config.real_serial {
+                    "real"
+                } else if mock_script_configured {
+                    "mock-script"
+                } else if config.mock_device {
+                    "mock"
+                } else {
+                    "memory"
+                },
+                real_serial: config.real_serial,
+                mock_device: config.mock_device,
+                mock_script_configured,
+            },
+            serial_defaults: DashboardSerialDefaults {
+                default_port_configured: config.serial_defaults.default_port.is_some(),
+                baud_rate: config.serial_defaults.default_baud_rate,
+                delimiter: config.serial_defaults.default_delimiter.clone(),
+            },
+            storage: DashboardStorageStatus {
+                presets,
+                persistent_presets: presets == "sqlite",
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +219,7 @@ pub struct AppState<L, C> {
     connection_manager: C,
     preset_store: Arc<dyn PresetStore>,
     dashboard_assets: PathBuf,
+    dashboard_status: DashboardStatusResponse,
 }
 
 impl<L, C> AppState<L, C> {
@@ -120,6 +229,7 @@ impl<L, C> AppState<L, C> {
             connection_manager,
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         }
     }
 
@@ -132,6 +242,7 @@ impl<L, C> AppState<L, C> {
             connection_manager,
             preset_store: Arc::new(preset_store),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         }
     }
 
@@ -145,6 +256,7 @@ impl<L, C> AppState<L, C> {
             connection_manager,
             preset_store,
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         }
     }
 
@@ -153,6 +265,11 @@ impl<L, C> AppState<L, C> {
         P: Into<PathBuf>,
     {
         self.dashboard_assets = dashboard_assets.into();
+        self
+    }
+
+    pub fn with_dashboard_status(mut self, dashboard_status: DashboardStatusResponse) -> Self {
+        self.dashboard_status = dashboard_status;
         self
     }
 }
@@ -199,6 +316,7 @@ pub fn router() -> Router {
         connection_manager: InMemoryConnectionManager::default(),
         preset_store: Arc::new(InMemoryPresetStore::default()),
         dashboard_assets: default_dashboard_assets_dir(),
+        dashboard_status: DashboardStatusResponse::default_memory(),
     })
 }
 
@@ -211,6 +329,7 @@ where
         connection_manager: InMemoryConnectionManager::default(),
         preset_store: Arc::new(InMemoryPresetStore::default()),
         dashboard_assets: default_dashboard_assets_dir(),
+        dashboard_status: DashboardStatusResponse::default_memory(),
     })
 }
 
@@ -224,6 +343,7 @@ where
         .route("/dashboard", get(dashboard::<L, C>))
         .route("/assets/:file", get(dashboard_asset::<L, C>))
         .route("/api/v1/health", get(health))
+        .route("/api/v1/status", get(status::<L, C>))
         .route("/api/v1/events", get(events::<L, C>))
         .route("/api/v1/events/ws", get(events_ws::<L, C>))
         .route("/socket.io/", get(socket_io_events::<L, C>))
@@ -338,6 +458,14 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+async fn status<L, C>(State(state): State<AppState<L, C>>) -> Json<DashboardStatusResponse>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    Json(state.dashboard_status.clone())
 }
 
 async fn ports<L, C>(State(state): State<AppState<L, C>>) -> Result<Json<PortsResponse>, StatusCode>
@@ -835,6 +963,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::config::{ResolvedServeConfig, SerialDefaults};
     use crate::error::Result;
     use crate::serial::manager::{
         ConnectionManagerWithTransport, InMemoryConnectionManager, PortInfo, SerialPortLister,
@@ -1308,6 +1437,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_route_returns_safe_default_dashboard_status() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            payload,
+            json!({
+                "server": {"status": "ok", "version": env!("CARGO_PKG_VERSION")},
+                "runtime": {
+                    "mode": "memory",
+                    "realSerial": false,
+                    "mockDevice": false,
+                    "mockScriptConfigured": false
+                },
+                "serialDefaults": {
+                    "defaultPortConfigured": false,
+                    "baudRate": 115200,
+                    "delimiter": "\r\n"
+                },
+                "storage": {
+                    "presets": "memory",
+                    "persistentPresets": false
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn status_route_reports_configured_modes_without_paths() {
+        let status = DashboardStatusResponse {
+            server: DashboardServerStatus {
+                status: "ok",
+                version: env!("CARGO_PKG_VERSION"),
+            },
+            runtime: DashboardRuntimeStatus {
+                mode: "mock-script",
+                real_serial: false,
+                mock_device: true,
+                mock_script_configured: true,
+            },
+            serial_defaults: DashboardSerialDefaults {
+                default_port_configured: true,
+                baud_rate: 57_600,
+                delimiter: "\n".to_string(),
+            },
+            storage: DashboardStorageStatus {
+                presets: "sqlite",
+                persistent_presets: true,
+            },
+        };
+        let app = router_with_state(
+            AppState::new(
+                MockPortLister { ports: Vec::new() },
+                InMemoryConnectionManager::default(),
+            )
+            .with_dashboard_status(status),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = std::str::from_utf8(&body).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            payload,
+            json!({
+                "server": {"status": "ok", "version": env!("CARGO_PKG_VERSION")},
+                "runtime": {
+                    "mode": "mock-script",
+                    "realSerial": false,
+                    "mockDevice": true,
+                    "mockScriptConfigured": true
+                },
+                "serialDefaults": {
+                    "defaultPortConfigured": true,
+                    "baudRate": 57600,
+                    "delimiter": "\n"
+                },
+                "storage": {
+                    "presets": "sqlite",
+                    "persistentPresets": true
+                }
+            })
+        );
+        for forbidden in [
+            "mock-responses.json",
+            "presets.db",
+            "/dev/ttyUSB0",
+            "web/dist",
+            "serialport-api.toml",
+            "preset_db",
+            "mock_script",
+            "dashboard_assets",
+        ] {
+            assert!(
+                !body_text.contains(forbidden),
+                "leaked forbidden value {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_status_from_resolved_config_reduces_paths_to_safe_flags() {
+        let resolved = ResolvedServeConfig {
+            host: "0.0.0.0".to_string(),
+            port: 5000,
+            mock_device: true,
+            mock_script: Some(PathBuf::from("./mock-responses.json")),
+            real_serial: false,
+            serial_defaults: SerialDefaults {
+                default_port: Some("/dev/ttyUSB0".to_string()),
+                default_baud_rate: 57_600,
+                default_delimiter: "\n".to_string(),
+            },
+            preset_db: Some(PathBuf::from("./presets.db")),
+        };
+
+        let status = DashboardStatusResponse::from_resolved_config(&resolved);
+        let body = serde_json::to_string(&status).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(
+            payload,
+            json!({
+                "server": {"status": "ok", "version": env!("CARGO_PKG_VERSION")},
+                "runtime": {
+                    "mode": "mock-script",
+                    "realSerial": false,
+                    "mockDevice": true,
+                    "mockScriptConfigured": true
+                },
+                "serialDefaults": {
+                    "defaultPortConfigured": true,
+                    "baudRate": 57600,
+                    "delimiter": "\n"
+                },
+                "storage": {
+                    "presets": "sqlite",
+                    "persistentPresets": true
+                }
+            })
+        );
+        for forbidden in [
+            "0.0.0.0",
+            "5000",
+            "mock-responses.json",
+            "presets.db",
+            "/dev/ttyUSB0",
+            "host",
+            "preset_db",
+            "mock_script",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "leaked forbidden value {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_status_from_resolved_config_reports_modes() {
+        let mut resolved = ResolvedServeConfig {
+            host: "127.0.0.1".to_string(),
+            port: 4002,
+            mock_device: false,
+            mock_script: None,
+            real_serial: false,
+            serial_defaults: SerialDefaults::default(),
+            preset_db: None,
+        };
+        assert_eq!(
+            DashboardStatusResponse::from_resolved_config(&resolved)
+                .runtime
+                .mode,
+            "memory"
+        );
+
+        resolved.mock_device = true;
+        assert_eq!(
+            DashboardStatusResponse::from_resolved_config(&resolved)
+                .runtime
+                .mode,
+            "mock"
+        );
+
+        resolved.mock_script = Some(PathBuf::from("./script.json"));
+        assert_eq!(
+            DashboardStatusResponse::from_resolved_config(&resolved)
+                .runtime
+                .mode,
+            "mock-script"
+        );
+
+        resolved.real_serial = true;
+        resolved.mock_device = false;
+        resolved.mock_script = None;
+        assert_eq!(
+            DashboardStatusResponse::from_resolved_config(&resolved)
+                .runtime
+                .mode,
+            "real"
+        );
+    }
+
+    #[tokio::test]
     async fn ports_route_returns_available_serial_ports() {
         let response = router_with_port_lister(MockPortLister {
             ports: vec![PortInfo {
@@ -1353,6 +1708,7 @@ mod tests {
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
 
         let create_response = app
@@ -1449,6 +1805,7 @@ mod tests {
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
 
         let create_response = app
@@ -1497,6 +1854,7 @@ mod tests {
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
 
         let create_response = app
@@ -1557,6 +1915,7 @@ mod tests {
             connection_manager: manager,
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         })
         .oneshot(
             Request::builder()
@@ -1607,6 +1966,7 @@ mod tests {
             connection_manager: manager,
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         })
         .oneshot(
             Request::builder()
@@ -1652,6 +2012,7 @@ mod tests {
             connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         })
         .oneshot(
             Request::builder()
@@ -1712,6 +2073,7 @@ mod tests {
             connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1774,6 +2136,7 @@ mod tests {
             connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1850,6 +2213,7 @@ mod tests {
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
 
         for uri in [
@@ -1881,6 +2245,7 @@ mod tests {
             connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
 
         let create_response = app
@@ -2004,6 +2369,7 @@ mod tests {
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
 
         let create_response = app
@@ -2049,6 +2415,7 @@ mod tests {
             connection_manager: manager.clone(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
 
         let create_response = app
@@ -2118,6 +2485,7 @@ mod tests {
             connection_manager: InMemoryConnectionManager::default(),
             preset_store: Arc::new(InMemoryPresetStore::default()),
             dashboard_assets: default_dashboard_assets_dir(),
+            dashboard_status: DashboardStatusResponse::default_memory(),
         });
 
         let list_response = app
