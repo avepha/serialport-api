@@ -32,13 +32,14 @@ Implemented now:
 - [x] Opt-in SQLite preset persistence with `--preset-db` or `[storage] preset_db`
 - [x] Raspberry Pi install guide and systemd service examples
 - [x] Dockerfile and Docker Compose example for local/container runs
-- [x] Tag-triggered GitHub release workflow for Linux binary and GHCR image publishing
+- [x] Tag-triggered GitHub release workflow for Linux x86_64 and Raspberry Pi ARM64 binary archives plus GHCR image publishing
+- [x] ARM/Raspberry Pi 64-bit release binary automation for `aarch64-unknown-linux-gnu`
 - [x] GitHub Actions CI for format, clippy, and tests
 - [x] Unit and route tests for current behavior
 
 Planned / not complete yet:
 
-- [ ] ARM/Raspberry Pi release binary automation
+- [ ] ARMv7 / 32-bit Raspberry Pi release artifacts, if maintainers want a verified 32-bit target
 
 ## Install / build
 
@@ -426,7 +427,14 @@ Other preset routes:
 
 ## Docker / release packaging
 
-For Docker-based local runs and release packaging, see [`docs/docker-release.md`](docs/docker-release.md). The repository includes a root `Dockerfile`, an optional [`examples/docker-compose.yml`](examples/docker-compose.yml), and a tag-triggered GitHub Actions release workflow for Linux x86_64 binary archives and GHCR image publishing.
+For Docker-based local runs and release packaging, see [`docs/docker-release.md`](docs/docker-release.md). The repository includes a root `Dockerfile`, an optional [`examples/docker-compose.yml`](examples/docker-compose.yml), and a tag-triggered GitHub Actions release workflow for deterministic Linux binary archives and GHCR image publishing.
+
+Release binary archives are named `serialport-api-${TAG}-${TARGET}.tar.gz` with matching `.sha256` files. The currently automated Linux targets are:
+
+- `x86_64-unknown-linux-gnu` for Linux desktops/servers.
+- `aarch64-unknown-linux-gnu` for 64-bit Raspberry Pi OS / ARM64 Linux.
+
+Use `sha256sum -c` against the downloaded checksum file before installing a binary. See the Docker/release guide and the [Raspberry Pi/systemd deployment guide](docs/raspberry-pi-systemd.md) for detailed artifact selection and install commands. ARMv7 / 32-bit Raspberry Pi release artifacts are not currently published; build from source on those systems.
 
 ## Raspberry Pi / systemd deployment
 
@@ -561,7 +569,7 @@ Important source files:
 
 Near-term work:
 
-- Add ARM/Raspberry Pi binary release automation if maintainers want prebuilt Pi artifacts.
+- Add ARMv7 / 32-bit Raspberry Pi release artifacts only if maintainers need them and the target can be verified reliably.
 
 ## License
 

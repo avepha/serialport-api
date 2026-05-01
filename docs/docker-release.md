@@ -135,12 +135,35 @@ git push origin v0.1.0
 
 The workflow:
 
-- Runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` before packaging.
-- Builds a locked Linux x86_64 release binary with `cargo build --release --locked`.
-- Uploads a tarball named like `serialport-api-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` to the GitHub release.
+- Runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` before packaging or publishing.
+- Builds locked Linux release binaries with explicit targets using `cargo build --release --locked --target "$TARGET"`.
+- Publishes deterministic tarballs named `serialport-api-${TAG}-${TARGET}.tar.gz` with matching `serialport-api-${TAG}-${TARGET}.tar.gz.sha256` checksum files.
+- Packages each archive with one top-level `serialport-api/` directory containing the `serialport-api` executable, `README.md`, `LICENSE`, and `ARTIFACT.txt` metadata.
 - Builds and publishes a GHCR image tagged with the pushed version tag using the repository `GITHUB_TOKEN`.
 
-ARM/Raspberry Pi release binaries are future work because reliable cross-linking for the current native dependencies should be added deliberately rather than making tag releases brittle.
+Automated Linux binary targets:
+
+- `x86_64-unknown-linux-gnu` for Linux desktops and servers.
+- `aarch64-unknown-linux-gnu` for Raspberry Pi OS 64-bit / ARM64 Linux.
+
+Example release assets for `v0.1.0`:
+
+```text
+serialport-api-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+serialport-api-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
+serialport-api-v0.1.0-aarch64-unknown-linux-gnu.tar.gz
+serialport-api-v0.1.0-aarch64-unknown-linux-gnu.tar.gz.sha256
+```
+
+Verify a downloaded archive before extracting it:
+
+```bash
+sha256sum -c serialport-api-v0.1.0-aarch64-unknown-linux-gnu.tar.gz.sha256
+```
+
+The ARM64 artifact is cross-built in GitHub Actions without requiring Raspberry Pi hardware in CI. CI proves build/package success only; real serial-device behavior remains a manual hardware check on the target host.
+
+ARMv7 / 32-bit Raspberry Pi release artifacts are not currently published because that target needs separate linker/sysroot validation. Build from source on 32-bit Pi OS, or use a 64-bit OS and the `aarch64-unknown-linux-gnu` artifact.
 
 Implementation sessions should not push tags, create releases manually, or publish packages from a local machine.
 

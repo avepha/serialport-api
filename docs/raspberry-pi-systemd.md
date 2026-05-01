@@ -2,9 +2,9 @@
 
 ## Supported deployment model
 
-Phase 14 documents how to run the current `serialport-api` server on Raspberry Pi OS or another Debian-like Linux distribution that uses systemd. It covers building from source on the device, or copying an already built binary, then running it as a boot-time service.
+Phase 14 documents how to run the current `serialport-api` server on Raspberry Pi OS or another Debian-like Linux distribution that uses systemd. It covers installing a prebuilt release binary when one matches the device architecture, building from source on the device, or copying an already built compatible binary, then running it as a boot-time service.
 
-Release artifacts, packaged `.deb` files, Docker images, and cross-compilation automation are intentionally left for a later phase.
+Tag-triggered GitHub releases publish a `aarch64-unknown-linux-gnu` archive for Raspberry Pi OS 64-bit / ARM64 Linux. ARMv7 / 32-bit Raspberry Pi OS release archives are not currently published; use the source-build fallback for 32-bit systems.
 
 The service remains hardware-free unless `real_serial = true` or `serve --real-serial` is enabled. Use real serial mode only when the configured serial device is attached and the service user has permission to access it.
 
@@ -36,6 +36,32 @@ cargo --version
 `Cargo.toml` currently requires Rust 1.75 or newer.
 
 ## Build and install the binary
+
+### Install a GitHub release binary on 64-bit Raspberry Pi OS
+
+Use the `aarch64-unknown-linux-gnu` release archive on Raspberry Pi OS 64-bit / ARM64 Linux. Check your architecture first:
+
+```bash
+uname -m
+```
+
+`aarch64` or `arm64` should use the `aarch64-unknown-linux-gnu` artifact. If the Pi reports `armv7l` or another 32-bit ARM architecture, build from source instead because ARMv7 release archives are not currently published.
+
+Download, verify, extract, install, and restart the service after replacing the binary:
+
+```bash
+version="v0.1.0"
+target="aarch64-unknown-linux-gnu"
+curl -LO "https://github.com/avepha/serialport-api/releases/download/${version}/serialport-api-${version}-${target}.tar.gz"
+curl -LO "https://github.com/avepha/serialport-api/releases/download/${version}/serialport-api-${version}-${target}.tar.gz.sha256"
+sha256sum -c "serialport-api-${version}-${target}.tar.gz.sha256"
+tar -xzf "serialport-api-${version}-${target}.tar.gz"
+sudo install -m 0755 serialport-api/serialport-api /usr/local/bin/serialport-api
+/usr/local/bin/serialport-api --version
+sudo systemctl restart serialport-api
+```
+
+Each archive expands to a single `serialport-api/` directory containing the executable, `README.md`, `LICENSE`, and release metadata. Release CI builds and packages the ARM64 binary without requiring Raspberry Pi hardware; serial hardware smoke checks remain manual on the Pi.
 
 ### Build from source on the Pi
 
