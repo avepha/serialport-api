@@ -24,6 +24,8 @@ Implemented now:
 - [x] Waited command responses matched by string `reqId`
 - [x] Opt-in mock-device/scripted responses for hardware-free response tests
 - [x] Opt-in real serial mode for opening/writing/reading OS serial ports
+- [x] Coordinated real serial read-loop lifecycle with hardware-free tests
+- [x] GitHub Actions CI for format, clippy, and tests
 - [x] Unit and route tests for current behavior
 
 Planned / not complete yet:
@@ -31,7 +33,6 @@ Planned / not complete yet:
 - [ ] Config file support
 - [ ] SQLite saved presets
 - [ ] Raspberry Pi install guide and systemd service
-- [ ] GitHub Actions CI
 - [ ] Release binaries / Docker image
 - [ ] WebSocket or Socket.IO support
 
