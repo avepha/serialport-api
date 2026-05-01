@@ -1,6 +1,6 @@
 # serialport-api
 
-`serialport-api` is a Rust service for JSON-based serial-port communication with microcontrollers, robots, and Raspberry Pi deployments. It exposes an HTTP API for listing ports, managing named connections, sending JSON commands, and streaming recorded serial events with Server-Sent Events or native WebSocket snapshots.
+`serialport-api` is a Rust service for JSON-based serial-port communication with microcontrollers, robots, and Raspberry Pi deployments. It exposes an HTTP API for listing ports, managing named connections, sending JSON commands, and streaming serial events with Server-Sent Events or WebSockets. Event streams replay the current in-memory history and then remain connected to tail live events.
 
 ## Status
 
@@ -19,9 +19,9 @@ Implemented now:
 - [x] Mock/in-memory named connection lifecycle
 - [x] Command endpoint with generated or preserved `reqId`
 - [x] JSON command framing as UTF-8 JSON plus delimiter, usually `\r\n`
-- [x] Server-Sent Events endpoint for recorded mock serial events
-- [x] Native WebSocket endpoint for recorded serial event snapshots
-- [x] Minimal Socket.IO/Engine.IO v4 WebSocket compatibility endpoint for recorded serial event snapshots
+- [x] Server-Sent Events endpoint for current in-memory serial events plus live updates
+- [x] Native WebSocket endpoint for current in-memory serial events plus live updates
+- [x] Minimal Socket.IO/Engine.IO v4 WebSocket compatibility endpoint for current in-memory serial events plus live updates
 - [x] Legacy aliases: `/list`, `/connect`, `/disconnect`, `/info`, `/commit`
 - [x] Waited command responses matched by string `reqId`
 - [x] Opt-in mock-device/scripted responses for hardware-free response tests
@@ -201,9 +201,9 @@ Expected notes:
 - Ports returns a JSON object with a `ports` array; it may be empty.
 - Connect returns `status: connected` and records the named connection in memory.
 - Command returns `status: queued` and a `reqId`.
-- Events returns SSE headers; a fresh server may have no event body.
-- The native WebSocket event endpoint is also available at `/api/v1/events/ws`; a fresh server may close without frames if no events have been recorded.
-- Minimal Socket.IO/Engine.IO clients can connect to `/socket.io/?EIO=4&transport=websocket` for the same recorded event snapshot; a fresh server may only send handshake frames before closing.
+- Events returns SSE headers, replays current in-memory events, and remains connected for new live events; a fresh server may have no event body until events are produced.
+- The native WebSocket event endpoint is also available at `/api/v1/events/ws`; it replays the same current in-memory events and remains connected for live updates.
+- Minimal Socket.IO/Engine.IO clients can connect to `/socket.io/?EIO=4&transport=websocket` for the same replay-then-live event stream using Socket.IO packet framing.
 - Disconnect returns `status: disconnected` for the requested name.
 
 ## HTTP API
@@ -347,7 +347,7 @@ Notes:
 
 ### `GET /api/v1/events`
 
-Stream recorded serial events as Server-Sent Events.
+Stream serial events as Server-Sent Events. On connection, the server replays current in-memory event history and then remains connected to tail new live events. Event history is in-memory only and non-durable; restarting the server clears it.
 
 ```bash
 curl -i -s http://127.0.0.1:4002/api/v1/events
@@ -368,11 +368,11 @@ Current event names:
 - `serial.notification`
 - `serial.error`
 
-Important current limitation: the server starts with no pre-seeded events, so a manual `curl` against a fresh server may show SSE headers with no event body. Route tests seed mock events and verify SSE formatting.
+Important current limitation: the server starts with no pre-seeded events, so a manual `curl` against a fresh server may show SSE headers with no event body until commands, mock scripts, or real serial input produce events. The open stream stays connected for subsequent events. Route tests seed mock events and verify SSE formatting.
 
 ### `GET /api/v1/events/ws`
 
-Open a native WebSocket connection and receive recorded serial event snapshots as JSON text frames. On connection, the server sends one frame per event currently returned by the same event snapshot store used by `GET /api/v1/events`, then closes the socket normally.
+Open a native WebSocket connection and receive serial events as JSON text frames. On connection, the server sends one frame per current in-memory event from the same event history used by `GET /api/v1/events`, then keeps the socket open and sends new live events as they arrive.
 
 ```bash
 websocat ws://127.0.0.1:4002/api/v1/events/ws
@@ -390,11 +390,11 @@ Example text frames:
 {"event":"serial.text","data":"hello robot"}
 ```
 
-A fresh server may have no recorded events, so the WebSocket can close without sending frames. This is a native WebSocket endpoint only; Socket.IO/Engine.IO clients are not compatible with `/api/v1/events/ws`.
+A fresh server may have no recorded events, so the WebSocket may not send event frames until commands, mock scripts, or real serial input produce events. Event history is in-memory only and non-durable; restarting the server clears it. This is a native WebSocket endpoint only; Socket.IO/Engine.IO clients are not compatible with `/api/v1/events/ws`.
 
 ### `GET /socket.io/?EIO=4&transport=websocket`
 
-Open a minimal Socket.IO-compatible Engine.IO v4 WebSocket connection and receive the same recorded serial event snapshot used by `GET /api/v1/events` and `GET /api/v1/events/ws`. This endpoint exists for legacy/browser clients that require Engine.IO and Socket.IO packet framing.
+Open a minimal Socket.IO-compatible Engine.IO v4 WebSocket connection and receive the same replay-then-live serial event stream used by `GET /api/v1/events` and `GET /api/v1/events/ws`. This endpoint exists for legacy/browser clients that require Engine.IO and Socket.IO packet framing.
 
 ```bash
 websocat 'ws://127.0.0.1:4002/socket.io/?EIO=4&transport=websocket'
@@ -404,7 +404,7 @@ Frame sequence:
 
 - Engine.IO open packet: `0{"sid":"...","upgrades":[],"pingInterval":25000,"pingTimeout":20000,"maxPayload":1000000}`
 - Socket.IO default namespace connect packet: `40`
-- One Socket.IO event packet per recorded serial event, then a normal close
+- One Socket.IO event packet per current in-memory serial event, followed by live event packets as new events arrive
 
 Example event frames:
 
@@ -420,7 +420,7 @@ Compatibility scope and limitations:
 
 - Supports only `EIO=4` and `transport=websocket`; missing or unsupported values return HTTP `400` before upgrade.
 - Supports only the default namespace and server-to-client serial event packets.
-- Sends a snapshot of already recorded events and then closes normally; it is not a live fan-out bus.
+- Replays current in-memory events and then remains connected to tail live events. Event history is in-memory only and non-durable; restarting the server clears it.
 - Does not implement long polling, rooms, acknowledgements, binary attachments, middleware, authentication, command submission, or full Socket.IO server feature parity.
 - For new simple clients, `GET /api/v1/events` SSE or `GET /api/v1/events/ws` native WebSocket are still recommended.
 

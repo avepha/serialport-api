@@ -326,7 +326,7 @@ Example event payload:
 }
 ```
 
-Native WebSocket snapshots are also available at `GET /events/ws`: the server sends JSON text frames shaped as `{ "event": "serial.json", "data": ... }` for the currently recorded event snapshot and then closes normally. Minimal Socket.IO/Engine.IO v4 WebSocket compatibility is available at `GET /socket.io/?EIO=4&transport=websocket`: the server sends an Engine.IO open packet, Socket.IO default namespace connect packet, then event packets shaped as `42["serial.json", ...]` for the recorded event snapshot before closing. Full Socket.IO feature parity (long polling, rooms, acknowledgements, binary payloads, multiple namespaces, or command submission) is intentionally out of scope.
+Native WebSocket streaming is also available at `GET /api/v1/events/ws`: the server sends JSON text frames shaped as `{ "event": "serial.json", "data": ... }` for current in-memory events and then remains connected to tail new live events. Minimal Socket.IO/Engine.IO v4 WebSocket compatibility is available at `GET /socket.io/?EIO=4&transport=websocket`: the server sends an Engine.IO open packet, Socket.IO default namespace connect packet, replays current in-memory events as packets shaped as `42["serial.json", ...]`, and then keeps the socket connected for live event packets. `GET /api/v1/events` SSE follows the same replay-then-live behavior. Event history is in-memory only and non-durable; restarting the server clears it. Full Socket.IO feature parity (long polling, rooms, acknowledgements, binary payloads, multiple namespaces, or command submission) is intentionally out of scope.
 
 ## CLI
 

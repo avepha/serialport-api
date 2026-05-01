@@ -74,7 +74,7 @@ function App() {
     ["serial.json", "serial.text", "serial.log", "serial.notification", "serial.error"].forEach((eventName) => {
       source.addEventListener(eventName, (event) => append(eventName, (event as MessageEvent).data));
     });
-    source.onerror = () => setEventStatus(source.readyState === EventSource.CLOSED ? "closed" : "snapshot ended or reconnecting");
+    source.onerror = () => setEventStatus(source.readyState === EventSource.CLOSED ? "closed" : "reconnecting to live stream");
     return () => source.close();
   }, []);
 
@@ -215,7 +215,7 @@ function App() {
           </TabsContent>
 
           <TabsContent value="events">
-            <Card><CardHeader><CardTitle>Events log</CardTitle><CardDescription>SSE snapshot and stream from /api/v1/events.</CardDescription></CardHeader><CardContent>
+            <Card><CardHeader><CardTitle>Events log</CardTitle><CardDescription>Live SSE from /api/v1/events with in-memory history replay.</CardDescription></CardHeader><CardContent>
               <ScrollArea className="h-96 rounded-md border bg-black/25 p-3">
                 {events.length === 0 ? <p className="text-sm text-muted-foreground">No events recorded yet. Send commands or connect a device to populate this log.</p> : events.map((item) => <pre key={item.id} className="mb-3 whitespace-pre-wrap rounded-md bg-muted/30 p-3 text-xs"><span className="text-sky-300">{item.event}</span>{"\n"}{item.data}</pre>)}
               </ScrollArea>
