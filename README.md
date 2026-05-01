@@ -252,8 +252,9 @@ Notes:
 
 - `payload` must be a JSON object.
 - If `payload.reqId` is missing, the in-memory manager generates one.
-- `waitForResponse` and `timeoutMs` are accepted in the request shape, but waited responses and timeout behavior are not implemented yet.
-- The queued command is framed as JSON plus the connection delimiter, usually `\r\n`.
+- `waitForResponse: true` waits for an inbound JSON response with the same string `reqId` until `timeoutMs` elapses; timeout returns HTTP `504`.
+- `waitForResponse: false` or omitted preserves the fire-and-forget queued response.
+- The command is framed as JSON plus the connection delimiter, usually `\r\n`.
 
 ### `GET /api/v1/events`
 
@@ -416,7 +417,6 @@ Later work:
 
 - SQLite-backed saved presets.
 - Raspberry Pi install docs and systemd unit examples.
-- GitHub Actions CI.
 - Release binaries and/or Docker image.
 - WebSocket or Socket.IO compatibility if needed for browser clients.
 
