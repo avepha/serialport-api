@@ -12,7 +12,7 @@ keywords = ["serialport", "microcontroller", "raspberry-pi", "json", "api"]
 categories = ["command-line-utilities", "embedded", "web-programming::http-server"]
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 serialport = "4"
 serde = { version = "1", features = ["derive"] }
@@ -26,5 +26,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+futures-util = "0.3"
 pretty_assertions = "1"
+tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }

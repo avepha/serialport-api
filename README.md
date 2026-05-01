@@ -1,6 +1,6 @@
 # serialport-api
 
-`serialport-api` is a Rust service for JSON-based serial-port communication with microcontrollers, robots, and Raspberry Pi deployments. It exposes an HTTP API for listing ports, managing named connections, sending JSON commands, and streaming serial events with Server-Sent Events.
+`serialport-api` is a Rust service for JSON-based serial-port communication with microcontrollers, robots, and Raspberry Pi deployments. It exposes an HTTP API for listing ports, managing named connections, sending JSON commands, and streaming recorded serial events with Server-Sent Events or native WebSocket snapshots.
 
 ## Status
 
@@ -20,6 +20,7 @@ Implemented now:
 - [x] Command endpoint with generated or preserved `reqId`
 - [x] JSON command framing as UTF-8 JSON plus delimiter, usually `\r\n`
 - [x] Server-Sent Events endpoint for recorded mock serial events
+- [x] Native WebSocket endpoint for recorded serial event snapshots
 - [x] Legacy aliases: `/list`, `/connect`, `/disconnect`, `/info`, `/commit`
 - [x] Waited command responses matched by string `reqId`
 - [x] Opt-in mock-device/scripted responses for hardware-free response tests
@@ -36,7 +37,7 @@ Implemented now:
 
 Planned / not complete yet:
 
-- [ ] WebSocket or Socket.IO support
+- [ ] Socket.IO protocol compatibility, if needed by legacy/browser clients
 - [ ] ARM/Raspberry Pi release binary automation
 
 ## Install / build
@@ -177,6 +178,7 @@ Expected notes:
 - Connect returns `status: connected` and records the named connection in memory.
 - Command returns `status: queued` and a `reqId`.
 - Events returns SSE headers; a fresh server may have no event body.
+- The native WebSocket event endpoint is also available at `/api/v1/events/ws`; a fresh server may close without frames if no events have been recorded.
 - Disconnect returns `status: disconnected` for the requested name.
 
 ## HTTP API
@@ -343,6 +345,28 @@ Current event names:
 
 Important current limitation: the server starts with no pre-seeded events, so a manual `curl` against a fresh server may show SSE headers with no event body. Route tests seed mock events and verify SSE formatting.
 
+### `GET /api/v1/events/ws`
+
+Open a native WebSocket connection and receive recorded serial event snapshots as JSON text frames. On connection, the server sends one frame per event currently returned by the same event snapshot store used by `GET /api/v1/events`, then closes the socket normally.
+
+```bash
+websocat ws://127.0.0.1:4002/api/v1/events/ws
+# or
+npx wscat -c ws://127.0.0.1:4002/api/v1/events/ws
+```
+
+Example text frames:
+
+```json
+{"event":"serial.json","data":{"reqId":"1","ok":true}}
+```
+
+```json
+{"event":"serial.text","data":"hello robot"}
+```
+
+A fresh server may have no recorded events, so the WebSocket can close without sending frames. This is a native WebSocket endpoint only; Socket.IO/Engine.IO clients are not compatible with `/api/v1/events/ws`.
+
 ## Saved command presets
 
 Preset routes store reusable JSON command payloads without opening serial ports or sending commands. By default, presets are in-memory and reset when the server exits. Use `--preset-db <PATH>` or `[storage] preset_db = "..."` to enable SQLite persistence.
@@ -508,7 +532,7 @@ Near-term work:
 
 Later work:
 
-- WebSocket or Socket.IO compatibility if needed for browser clients.
+- Socket.IO protocol compatibility if needed for legacy/browser clients that require Engine.IO framing.
 
 ## License
 

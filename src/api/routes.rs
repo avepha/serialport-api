@@ -1,5 +1,8 @@
 use axum::{
-    extract::{Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     http::StatusCode,
     response::{
         sse::{Event, Sse},
@@ -14,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 use crate::serial::manager::{
     list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
-    PortInfo, SerialPortLister, SystemPortLister,
+    PortInfo, SerialPortLister, SerialStreamEvent, SystemPortLister,
 };
 use crate::storage::{CreatePreset, InMemoryPresetStore, Preset, PresetStore, PresetStoreError};
 
@@ -158,6 +161,7 @@ where
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/events", get(events::<L, C>))
+        .route("/api/v1/events/ws", get(events_ws::<L, C>))
         .route("/api/v1/ports", get(ports::<L, C>))
         .route("/list", get(ports::<L, C>))
         .route(
@@ -225,6 +229,41 @@ where
     }));
 
     Ok(Sse::new(stream))
+}
+
+async fn events_ws<L, C>(
+    State(state): State<AppState<L, C>>,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, StatusCode>
+where
+    L: SerialPortLister,
+    C: ConnectionManager,
+{
+    let events = state
+        .connection_manager
+        .events()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(ws.on_upgrade(move |socket| send_event_snapshot(socket, events)))
+}
+
+async fn send_event_snapshot(mut socket: WebSocket, events: Vec<SerialStreamEvent>) {
+    for serial_event in events {
+        let payload = json!({
+            "event": serial_event.event,
+            "data": serial_event.data,
+        });
+
+        let Ok(text) = serde_json::to_string(&payload) else {
+            break;
+        };
+
+        if socket.send(Message::Text(text)).await.is_err() {
+            break;
+        }
+    }
+
+    let _ = socket.close().await;
 }
 
 async fn list_presets<L, C>(
@@ -489,6 +528,7 @@ where
 mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use futures_util::StreamExt;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tower::ServiceExt;
@@ -1139,6 +1179,56 @@ mod tests {
         assert!(body.contains("data: {\"ok\":true,\"reqId\":\"1\"}"));
         assert!(body.contains("event: serial.text"));
         assert!(body.contains("data: \"hello robot\""));
+    }
+
+    #[tokio::test]
+    async fn events_ws_streams_recorded_serial_events_as_json_text_frames() {
+        let manager = InMemoryConnectionManager::default();
+        manager.record_event(crate::protocol::SerialEvent::Json(json!({
+            "reqId": "1",
+            "ok": true
+        })));
+        manager.record_event(crate::protocol::SerialEvent::Text(
+            "hello robot".to_string(),
+        ));
+
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: manager,
+            preset_store: Arc::new(InMemoryPresetStore::default()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/events/ws"))
+                .await
+                .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(first.to_text().unwrap()).unwrap(),
+            json!({"event":"serial.json","data":{"reqId":"1","ok":true}})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(second.to_text().unwrap()).unwrap(),
+            json!({"event":"serial.text","data":"hello robot"})
+        );
+
+        server.abort();
     }
 
     #[tokio::test(start_paused = true)]

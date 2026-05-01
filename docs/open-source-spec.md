@@ -326,7 +326,7 @@ Example event payload:
 }
 ```
 
-WebSocket can be added later for bidirectional browser clients.
+Native WebSocket snapshots are also available at `GET /events/ws`: the server sends JSON text frames shaped as `{ "event": "serial.json", "data": ... }` for the currently recorded event snapshot and then closes normally. Socket.IO/Engine.IO protocol compatibility remains separate future work; native WebSocket clients can use `/events/ws`, but Socket.IO clients cannot.
 
 ## CLI
 
