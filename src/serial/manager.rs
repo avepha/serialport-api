@@ -6,6 +6,7 @@ use serde_json::Value;
 use serialport::{SerialPortInfo, SerialPortType};
 
 use crate::error::{Result, SerialportApiError};
+use crate::serial::transport::{MockSerialTransport, SerialTransport};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PortInfo {
@@ -50,13 +51,15 @@ pub struct SerialStreamEvent {
     pub data: Value,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct InMemoryConnectionManager {
+#[derive(Clone, Debug)]
+pub struct ConnectionManagerWithTransport<T> {
     connections: Arc<Mutex<BTreeMap<String, ConnectionInfo>>>,
     next_req_id: Arc<Mutex<u64>>,
-    written_frames: Arc<Mutex<BTreeMap<String, Vec<Vec<u8>>>>>,
     events: Arc<Mutex<Vec<SerialStreamEvent>>>,
+    transport: T,
 }
+
+pub type InMemoryConnectionManager = ConnectionManagerWithTransport<MockSerialTransport>;
 
 pub trait ConnectionManager: Clone + Send + Sync + 'static {
     fn connect(&self, request: ConnectionRequest) -> Result<ConnectionInfo>;
@@ -66,15 +69,21 @@ pub trait ConnectionManager: Clone + Send + Sync + 'static {
     fn events(&self) -> Result<Vec<SerialStreamEvent>>;
 }
 
-impl InMemoryConnectionManager {
-    #[cfg(test)]
-    pub fn written_frames(&self, name: &str) -> Vec<Vec<u8>> {
-        self.written_frames
-            .lock()
-            .expect("in-memory written frames lock poisoned")
-            .get(name)
-            .cloned()
-            .unwrap_or_default()
+impl<T> ConnectionManagerWithTransport<T>
+where
+    T: SerialTransport,
+{
+    pub fn new(transport: T) -> Self {
+        Self {
+            connections: Arc::default(),
+            next_req_id: Arc::default(),
+            events: Arc::default(),
+            transport,
+        }
+    }
+
+    pub fn transport(&self) -> T {
+        self.transport.clone()
     }
 
     pub fn record_event(&self, event: crate::protocol::SerialEvent) {
@@ -93,6 +102,22 @@ impl InMemoryConnectionManager {
                 event: "serial.error",
                 data: Value::String(message.into()),
             });
+    }
+}
+
+impl<T> Default for ConnectionManagerWithTransport<T>
+where
+    T: SerialTransport + Default,
+{
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl ConnectionManagerWithTransport<MockSerialTransport> {
+    #[cfg(test)]
+    pub fn written_frames(&self, name: &str) -> Vec<Vec<u8>> {
+        self.transport.written_frames(name)
     }
 }
 
@@ -119,7 +144,10 @@ impl From<crate::protocol::SerialEvent> for SerialStreamEvent {
     }
 }
 
-impl ConnectionManager for InMemoryConnectionManager {
+impl<T> ConnectionManager for ConnectionManagerWithTransport<T>
+where
+    T: SerialTransport,
+{
     fn connect(&self, request: ConnectionRequest) -> Result<ConnectionInfo> {
         let connection = ConnectionInfo {
             name: request.name,
@@ -128,6 +156,8 @@ impl ConnectionManager for InMemoryConnectionManager {
             baud_rate: request.baud_rate,
             delimiter: request.delimiter,
         };
+
+        self.transport.open(&connection)?;
 
         self.connections
             .lock()
@@ -152,6 +182,7 @@ impl ConnectionManager for InMemoryConnectionManager {
             .lock()
             .expect("in-memory connection registry lock poisoned")
             .remove(name);
+        self.transport.close(name)?;
 
         Ok(name.to_string())
     }
@@ -184,12 +215,7 @@ impl ConnectionManager for InMemoryConnectionManager {
         };
 
         let frame = crate::protocol::frame_json(&payload, &connection.delimiter)?;
-        self.written_frames
-            .lock()
-            .expect("in-memory written frames lock poisoned")
-            .entry(connection_name.to_string())
-            .or_default()
-            .push(frame);
+        self.transport.write_frame(connection_name, &frame)?;
 
         Ok(QueuedCommand { req_id })
     }
@@ -249,6 +275,7 @@ mod tests {
 
     use super::*;
     use crate::error::Result;
+    use crate::serial::transport::MockSerialTransport;
 
     #[derive(Clone)]
     struct MockPortLister {
@@ -304,6 +331,28 @@ mod tests {
     }
 
     #[test]
+    fn connection_manager_opens_and_closes_transport_connections() {
+        let transport = MockSerialTransport::default();
+        let manager = ConnectionManagerWithTransport::new(transport.clone());
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ROBOT".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+
+        assert_eq!(transport.opened_names(), vec!["default".to_string()]);
+
+        manager.disconnect("default").unwrap();
+
+        assert_eq!(transport.opened_names(), Vec::<String>::new());
+        assert_eq!(transport.closed_names(), vec!["default".to_string()]);
+    }
+
+    #[test]
     fn in_memory_connection_manager_removes_disconnected_connections() {
         let manager = InMemoryConnectionManager::default();
 
@@ -348,6 +397,48 @@ mod tests {
 
         assert_eq!(queued.req_id, "1");
         let frames = manager.written_frames("default");
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].ends_with(b"\r\n"));
+        let body = &frames[0][..frames[0].len() - 2];
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "reqId": "1",
+                "method": "query",
+                "topic": "sensor.read",
+                "data": {}
+            })
+        );
+    }
+
+    #[test]
+    fn connection_manager_writes_framed_command_through_transport_with_generated_req_id() {
+        let transport = MockSerialTransport::default();
+        let manager = ConnectionManagerWithTransport::new(transport.clone());
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ROBOT".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+
+        let queued = manager
+            .send_command(
+                "default",
+                serde_json::json!({
+                    "method": "query",
+                    "topic": "sensor.read",
+                    "data": {}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(queued.req_id, "1");
+        let frames = transport.written_frames("default");
         assert_eq!(frames.len(), 1);
         assert!(frames[0].ends_with(b"\r\n"));
         let body = &frames[0][..frames[0].len() - 2];
