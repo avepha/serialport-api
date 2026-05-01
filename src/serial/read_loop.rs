@@ -16,8 +16,21 @@ pub trait SerialReadSource: Clone + Send + Sync + 'static {
 }
 
 pub trait SerialEventRecorder: Clone + Send + Sync + 'static {
-    fn record_serial_event(&self, event: crate::protocol::SerialEvent);
-    fn record_serial_error(&self, message: String);
+    fn record_serial_event_for_connection(
+        &self,
+        connection_name: &str,
+        event: crate::protocol::SerialEvent,
+    );
+
+    fn record_serial_error_for_connection(&self, connection_name: &str, message: String);
+
+    fn record_serial_event(&self, event: crate::protocol::SerialEvent) {
+        self.record_serial_event_for_connection("default", event);
+    }
+
+    fn record_serial_error(&self, message: String) {
+        self.record_serial_error_for_connection("default", message);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -60,11 +73,15 @@ impl<T> SerialEventRecorder for ConnectionManagerWithTransport<T>
 where
     T: SerialTransport,
 {
-    fn record_serial_event(&self, event: crate::protocol::SerialEvent) {
-        self.record_event(event);
+    fn record_serial_event_for_connection(
+        &self,
+        connection_name: &str,
+        event: crate::protocol::SerialEvent,
+    ) {
+        self.record_event_for_connection(connection_name, event);
     }
 
-    fn record_serial_error(&self, message: String) {
+    fn record_serial_error_for_connection(&self, _connection_name: &str, message: String) {
         self.record_error(message);
     }
 }
@@ -84,9 +101,14 @@ where
     for item in items {
         match item {
             SerialReadItem::Line(line) => {
-                manager.record_serial_event(crate::protocol::parse_line(&line));
+                manager.record_serial_event_for_connection(
+                    connection_name,
+                    crate::protocol::parse_line(&line),
+                );
             }
-            SerialReadItem::Error(message) => manager.record_serial_error(message),
+            SerialReadItem::Error(message) => {
+                manager.record_serial_error_for_connection(connection_name, message);
+            }
         }
     }
 
@@ -200,6 +222,34 @@ mod tests {
             vec![SerialStreamEvent {
                 event: "serial.error",
                 data: serde_json::json!("serial read failed"),
+            }]
+        );
+    }
+
+    #[test]
+    fn drain_read_items_indexes_json_response_for_connection() {
+        use crate::serial::manager::{
+            ConnectionManager, InMemoryConnectionManager, SerialStreamEvent,
+        };
+
+        let manager = InMemoryConnectionManager::default();
+        let source = MockSerialReadSource::default();
+
+        source.push_line("robot", b"{\"reqId\":\"42\",\"ok\":true}\r\n".to_vec());
+
+        let processed = drain_serial_read_items(&manager, &source, "robot").unwrap();
+
+        assert_eq!(processed, 1);
+        assert_eq!(manager.take_response("default", "42").unwrap(), None);
+        assert_eq!(
+            manager.take_response("robot", "42").unwrap(),
+            Some(serde_json::json!({"reqId":"42","ok":true}))
+        );
+        assert_eq!(
+            manager.events().unwrap(),
+            vec![SerialStreamEvent {
+                event: "serial.json",
+                data: serde_json::json!({"reqId":"42","ok":true}),
             }]
         );
     }

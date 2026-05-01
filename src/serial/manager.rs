@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -51,11 +51,14 @@ pub struct SerialStreamEvent {
     pub data: Value,
 }
 
+type ResponseQueue = BTreeMap<String, BTreeMap<String, VecDeque<Value>>>;
+
 #[derive(Clone, Debug)]
 pub struct ConnectionManagerWithTransport<T> {
     connections: Arc<Mutex<BTreeMap<String, ConnectionInfo>>>,
     next_req_id: Arc<Mutex<u64>>,
     events: Arc<Mutex<Vec<SerialStreamEvent>>>,
+    responses_by_connection_and_req_id: Arc<Mutex<ResponseQueue>>,
     transport: T,
 }
 
@@ -66,6 +69,7 @@ pub trait ConnectionManager: Clone + Send + Sync + 'static {
     fn connections(&self) -> Result<Vec<ConnectionInfo>>;
     fn disconnect(&self, name: &str) -> Result<String>;
     fn send_command(&self, connection_name: &str, payload: Value) -> Result<QueuedCommand>;
+    fn take_response(&self, connection_name: &str, req_id: &str) -> Result<Option<Value>>;
     fn events(&self) -> Result<Vec<SerialStreamEvent>>;
 }
 
@@ -78,6 +82,7 @@ where
             connections: Arc::default(),
             next_req_id: Arc::default(),
             events: Arc::default(),
+            responses_by_connection_and_req_id: Arc::default(),
             transport,
         }
     }
@@ -87,11 +92,56 @@ where
     }
 
     pub fn record_event(&self, event: crate::protocol::SerialEvent) {
+        self.record_event_for_connection("default", event);
+    }
+
+    pub fn record_event_for_connection(
+        &self,
+        connection_name: &str,
+        event: crate::protocol::SerialEvent,
+    ) {
+        if let crate::protocol::SerialEvent::Json(value) = &event {
+            if let Some(req_id) = value.get("reqId").and_then(Value::as_str) {
+                self.responses_by_connection_and_req_id
+                    .lock()
+                    .expect("in-memory response queue lock poisoned")
+                    .entry(connection_name.to_string())
+                    .or_default()
+                    .entry(req_id.to_string())
+                    .or_default()
+                    .push_back(value.clone());
+            }
+        }
+
         let event = SerialStreamEvent::from(event);
         self.events
             .lock()
             .expect("in-memory serial events lock poisoned")
             .push(event);
+    }
+
+    pub fn take_response(&self, connection_name: &str, req_id: &str) -> Result<Option<Value>> {
+        let mut responses = self
+            .responses_by_connection_and_req_id
+            .lock()
+            .expect("in-memory response queue lock poisoned");
+
+        let Some(responses_by_req_id) = responses.get_mut(connection_name) else {
+            return Ok(None);
+        };
+        let Some(queue) = responses_by_req_id.get_mut(req_id) else {
+            return Ok(None);
+        };
+
+        let response = queue.pop_front();
+        if queue.is_empty() {
+            responses_by_req_id.remove(req_id);
+        }
+        if responses_by_req_id.is_empty() {
+            responses.remove(connection_name);
+        }
+
+        Ok(response)
     }
 
     pub fn record_error(&self, message: impl Into<String>) {
@@ -218,6 +268,10 @@ where
         self.transport.write_frame(connection_name, &frame)?;
 
         Ok(QueuedCommand { req_id })
+    }
+
+    fn take_response(&self, connection_name: &str, req_id: &str) -> Result<Option<Value>> {
+        Self::take_response(self, connection_name, req_id)
     }
 
     fn events(&self) -> Result<Vec<SerialStreamEvent>> {
@@ -544,5 +598,108 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn manager_indexes_json_response_by_connection_and_req_id() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Json(serde_json::json!({
+                "reqId": "1",
+                "ok": true,
+                "data": {"temperature": 28.5}
+            })),
+        );
+
+        assert_eq!(
+            manager.take_response("default", "1").unwrap(),
+            Some(serde_json::json!({
+                "reqId": "1",
+                "ok": true,
+                "data": {"temperature": 28.5}
+            }))
+        );
+        assert_eq!(manager.take_response("default", "1").unwrap(), None);
+        assert_eq!(
+            manager.events().unwrap(),
+            vec![SerialStreamEvent {
+                event: "serial.json",
+                data: serde_json::json!({
+                    "reqId": "1",
+                    "ok": true,
+                    "data": {"temperature": 28.5}
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn manager_does_not_match_responses_across_connections() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Json(serde_json::json!({"reqId":"1","ok":true})),
+        );
+
+        assert_eq!(manager.take_response("other", "1").unwrap(), None);
+        assert_eq!(
+            manager.take_response("default", "1").unwrap(),
+            Some(serde_json::json!({"reqId":"1","ok":true}))
+        );
+    }
+
+    #[test]
+    fn manager_returns_duplicate_req_id_responses_fifo() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Json(serde_json::json!({"reqId":"1","seq":1})),
+        );
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Json(serde_json::json!({"reqId":"1","seq":2})),
+        );
+
+        assert_eq!(
+            manager.take_response("default", "1").unwrap(),
+            Some(serde_json::json!({"reqId":"1","seq":1}))
+        );
+        assert_eq!(
+            manager.take_response("default", "1").unwrap(),
+            Some(serde_json::json!({"reqId":"1","seq":2}))
+        );
+        assert_eq!(manager.take_response("default", "1").unwrap(), None);
+    }
+
+    #[test]
+    fn manager_ignores_events_without_string_req_id_for_response_matching() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Text("hello".to_string()),
+        );
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Json(serde_json::json!({"ok":true})),
+        );
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Json(serde_json::json!({"reqId":1,"ok":true})),
+        );
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Log(serde_json::json!({
+                "method":"log",
+                "reqId":"1",
+                "data":{}
+            })),
+        );
+
+        assert_eq!(manager.take_response("default", "1").unwrap(), None);
     }
 }

@@ -1,12 +1,16 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::sse::{Event, Sse},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse,
+    },
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::serial::manager::{
     list_ports, ConnectionInfo, ConnectionManager, ConnectionRequest, InMemoryConnectionManager,
@@ -50,9 +54,9 @@ struct DisconnectRequest {
 struct CommandRequest {
     payload: Value,
     #[serde(rename = "waitForResponse", default)]
-    _wait_for_response: bool,
+    wait_for_response: bool,
     #[serde(rename = "timeoutMs")]
-    _timeout_ms: Option<u64>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +64,14 @@ struct CommandResponse {
     status: &'static str,
     #[serde(rename = "reqId")]
     req_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WaitedCommandResponse {
+    status: &'static str,
+    #[serde(rename = "reqId")]
+    req_id: String,
+    response: Value,
 }
 
 #[derive(Clone)]
@@ -190,25 +202,78 @@ async fn send_command<L, C>(
     State(state): State<AppState<L, C>>,
     Path(name): Path<String>,
     Json(request): Json<CommandRequest>,
-) -> Result<Json<CommandResponse>, StatusCode>
+) -> Result<axum::response::Response, StatusCode>
 where
     L: SerialPortLister,
     C: ConnectionManager,
 {
     let CommandRequest {
         payload,
-        _wait_for_response: _,
-        _timeout_ms: _,
+        wait_for_response,
+        timeout_ms,
     } = request;
     let queued = state
         .connection_manager
         .send_command(&name, payload)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(CommandResponse {
-        status: "queued",
-        req_id: queued.req_id,
-    }))
+    if !wait_for_response {
+        return Ok(Json(CommandResponse {
+            status: "queued",
+            req_id: queued.req_id,
+        })
+        .into_response());
+    }
+
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(2_000));
+    match await_command_response(&state.connection_manager, &name, &queued.req_id, timeout)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        Some(response) => Ok(Json(WaitedCommandResponse {
+            status: "ok",
+            req_id: queued.req_id,
+            response,
+        })
+        .into_response()),
+        None => Ok((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({"error":"command timed out"})),
+        )
+            .into_response()),
+    }
+}
+
+async fn await_command_response<C>(
+    manager: &C,
+    connection_name: &str,
+    req_id: &str,
+    timeout: Duration,
+) -> crate::error::Result<Option<Value>>
+where
+    C: ConnectionManager,
+{
+    if timeout.is_zero() {
+        return manager.take_response(connection_name, req_id);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(response) = manager.take_response(connection_name, req_id)? {
+            return Ok(Some(response));
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+
+        tokio::time::sleep(std::cmp::min(
+            Duration::from_millis(10),
+            deadline.saturating_duration_since(now),
+        ))
+        .await;
+    }
 }
 
 async fn disconnect<L, C>(
@@ -619,6 +684,176 @@ mod tests {
         assert!(body.contains("data: {\"ok\":true,\"reqId\":\"1\"}"));
         assert!(body.contains("event: serial.text"));
         assert!(body.contains("data: \"hello robot\""));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_route_waits_for_matching_response() {
+        let manager = InMemoryConnectionManager::default();
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: manager.clone(),
+        });
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/ROBOT","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let request = app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/connections/default/commands")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload":{"reqId":"client-99","method":"query","topic":"sensor.read","data":{}},"waitForResponse":true,"timeoutMs":1000}"#,
+                ))
+                .unwrap(),
+        );
+
+        tokio::pin!(request);
+        tokio::task::yield_now().await;
+
+        manager.record_event_for_connection(
+            "default",
+            crate::protocol::SerialEvent::Json(json!({
+                "reqId": "client-99",
+                "ok": true,
+                "data": {"temperature": 28.5}
+            })),
+        );
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            payload,
+            json!({
+                "status": "ok",
+                "reqId": "client-99",
+                "response": {
+                    "reqId": "client-99",
+                    "ok": true,
+                    "data": {"temperature": 28.5}
+                }
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_route_times_out_waiting_for_response() {
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: InMemoryConnectionManager::default(),
+        });
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/ROBOT","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let request = app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/connections/default/commands")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload":{"reqId":"will-timeout","method":"query","topic":"sensor.read","data":{}},"waitForResponse":true,"timeoutMs":50}"#,
+                ))
+                .unwrap(),
+        );
+
+        tokio::pin!(request);
+        tokio::time::advance(std::time::Duration::from_millis(60)).await;
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_route_waits_for_read_loop_recorded_response() {
+        let manager = InMemoryConnectionManager::default();
+        let read_source = crate::serial::read_loop::MockSerialReadSource::default();
+        let app = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: manager.clone(),
+        });
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/ROBOT","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let request = app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/connections/default/commands")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"payload":{"reqId":"loop-1","method":"query","topic":"sensor.read","data":{}},"waitForResponse":true,"timeoutMs":1000}"#,
+                ))
+                .unwrap(),
+        );
+
+        tokio::pin!(request);
+        tokio::task::yield_now().await;
+
+        read_source.push_line(
+            "default",
+            b"{\"reqId\":\"loop-1\",\"ok\":true}\r\n".to_vec(),
+        );
+        crate::serial::read_loop::drain_serial_read_items(&manager, &read_source, "default")
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            payload,
+            json!({
+                "status": "ok",
+                "reqId": "loop-1",
+                "response": {"reqId":"loop-1","ok":true}
+            })
+        );
     }
 
     #[tokio::test]
