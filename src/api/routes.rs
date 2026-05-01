@@ -80,6 +80,15 @@ pub struct AppState<L, C> {
     connection_manager: C,
 }
 
+impl<L, C> AppState<L, C> {
+    pub fn new(port_lister: L, connection_manager: C) -> Self {
+        Self {
+            port_lister,
+            connection_manager,
+        }
+    }
+}
+
 pub fn router() -> Router {
     router_with_state(AppState {
         port_lister: SystemPortLister,
@@ -343,7 +352,9 @@ mod tests {
 
     use super::*;
     use crate::error::Result;
-    use crate::serial::manager::{InMemoryConnectionManager, PortInfo, SerialPortLister};
+    use crate::serial::manager::{
+        ConnectionManagerWithTransport, InMemoryConnectionManager, PortInfo, SerialPortLister,
+    };
 
     #[derive(Clone)]
     struct MockPortLister {
@@ -748,6 +759,61 @@ mod tests {
                     "reqId": "client-99",
                     "ok": true,
                     "data": {"temperature": 28.5}
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn command_route_waits_for_mock_device_response() {
+        let manager = ConnectionManagerWithTransport::with_mock_responder(
+            crate::serial::transport::MockSerialTransport::default(),
+            crate::serial::mock_device::MockDeviceResponder::default(),
+        );
+        let app = router_with_state(AppState::new(MockPortLister { ports: Vec::new() }, manager));
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"default","port":"/dev/ROBOT","baudRate":115200,"delimiter":"\r\n"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/connections/default/commands")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"payload":{"reqId":"mock-route-1","method":"query","topic":"sensor.read","data":{}},"waitForResponse":true,"timeoutMs":1000}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "status": "ok",
+                "reqId": "mock-route-1",
+                "response": {
+                    "reqId": "mock-route-1",
+                    "ok": true,
+                    "data": {"mock": true, "topic": "sensor.read"}
                 }
             })
         );

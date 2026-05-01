@@ -6,6 +6,7 @@ use serde_json::Value;
 use serialport::{SerialPortInfo, SerialPortType};
 
 use crate::error::{Result, SerialportApiError};
+use crate::serial::mock_device::MockDeviceResponder;
 use crate::serial::transport::{MockSerialTransport, SerialTransport};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -60,6 +61,7 @@ pub struct ConnectionManagerWithTransport<T> {
     events: Arc<Mutex<Vec<SerialStreamEvent>>>,
     responses_by_connection_and_req_id: Arc<Mutex<ResponseQueue>>,
     transport: T,
+    mock_responder: Option<MockDeviceResponder>,
 }
 
 pub type InMemoryConnectionManager = ConnectionManagerWithTransport<MockSerialTransport>;
@@ -84,6 +86,18 @@ where
             events: Arc::default(),
             responses_by_connection_and_req_id: Arc::default(),
             transport,
+            mock_responder: None,
+        }
+    }
+
+    pub fn with_mock_responder(transport: T, responder: MockDeviceResponder) -> Self {
+        Self {
+            connections: Arc::default(),
+            next_req_id: Arc::default(),
+            events: Arc::default(),
+            responses_by_connection_and_req_id: Arc::default(),
+            transport,
+            mock_responder: Some(responder),
         }
     }
 
@@ -266,6 +280,15 @@ where
 
         let frame = crate::protocol::frame_json(&payload, &connection.delimiter)?;
         self.transport.write_frame(connection_name, &frame)?;
+
+        if let Some(responder) = &self.mock_responder {
+            if let Some(response) = responder.response_for_frame(&frame, &connection.delimiter) {
+                self.record_event_for_connection(
+                    connection_name,
+                    crate::protocol::SerialEvent::Json(response),
+                );
+            }
+        }
 
         Ok(QueuedCommand { req_id })
     }
@@ -701,5 +724,65 @@ mod tests {
         );
 
         assert_eq!(manager.take_response("default", "1").unwrap(), None);
+    }
+
+    #[test]
+    fn manager_with_mock_responder_records_response_after_send_command() {
+        let transport = crate::serial::transport::MockSerialTransport::default();
+        let manager = ConnectionManagerWithTransport::with_mock_responder(
+            transport,
+            crate::serial::mock_device::MockDeviceResponder::default(),
+        );
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ROBOT".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+
+        let queued = manager
+            .send_command(
+                "default",
+                serde_json::json!({"reqId":"mock-1","method":"query","topic":"sensor.read","data":{}}),
+            )
+            .unwrap();
+
+        assert_eq!(queued.req_id, "mock-1");
+        assert_eq!(
+            manager.take_response("default", "mock-1").unwrap(),
+            Some(serde_json::json!({
+                "reqId": "mock-1",
+                "ok": true,
+                "data": {"mock": true, "topic": "sensor.read"}
+            }))
+        );
+        assert_eq!(manager.events().unwrap()[0].event, "serial.json");
+    }
+
+    #[test]
+    fn default_manager_does_not_auto_record_mock_response() {
+        let manager = InMemoryConnectionManager::default();
+
+        manager
+            .connect(ConnectionRequest {
+                name: "default".to_string(),
+                port: "/dev/ROBOT".to_string(),
+                baud_rate: 115200,
+                delimiter: "\r\n".to_string(),
+            })
+            .unwrap();
+
+        manager
+            .send_command(
+                "default",
+                serde_json::json!({"reqId":"no-auto","topic":"sensor.read","data":{}}),
+            )
+            .unwrap();
+
+        assert_eq!(manager.take_response("default", "no-auto").unwrap(), None);
+        assert_eq!(manager.events().unwrap(), vec![]);
     }
 }
