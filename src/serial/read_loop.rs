@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
+use crate::serial::manager::ConnectionManagerWithTransport;
+use crate::serial::transport::SerialTransport;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SerialReadItem {
@@ -11,6 +13,11 @@ pub enum SerialReadItem {
 
 pub trait SerialReadSource: Clone + Send + Sync + 'static {
     fn drain_items(&self, connection_name: &str) -> Result<Vec<SerialReadItem>>;
+}
+
+pub trait SerialEventRecorder: Clone + Send + Sync + 'static {
+    fn record_serial_event(&self, event: crate::protocol::SerialEvent);
+    fn record_serial_error(&self, message: String);
 }
 
 #[derive(Clone, Debug, Default)]
@@ -49,6 +56,57 @@ impl SerialReadSource for MockSerialReadSource {
     }
 }
 
+impl<T> SerialEventRecorder for ConnectionManagerWithTransport<T>
+where
+    T: SerialTransport,
+{
+    fn record_serial_event(&self, event: crate::protocol::SerialEvent) {
+        self.record_event(event);
+    }
+
+    fn record_serial_error(&self, message: String) {
+        self.record_error(message);
+    }
+}
+
+pub fn drain_serial_read_items<M, R>(
+    manager: &M,
+    read_source: &R,
+    connection_name: &str,
+) -> Result<usize>
+where
+    M: SerialEventRecorder,
+    R: SerialReadSource,
+{
+    let items = read_source.drain_items(connection_name)?;
+    let processed = items.len();
+
+    for item in items {
+        match item {
+            SerialReadItem::Line(line) => {
+                manager.record_serial_event(crate::protocol::parse_line(&line));
+            }
+            SerialReadItem::Error(message) => manager.record_serial_error(message),
+        }
+    }
+
+    Ok(processed)
+}
+
+pub fn spawn_mock_read_loop<M, R>(
+    manager: M,
+    read_source: R,
+    connection_name: String,
+) -> tokio::task::JoinHandle<()>
+where
+    M: SerialEventRecorder,
+    R: SerialReadSource,
+{
+    tokio::spawn(async move {
+        let _ = drain_serial_read_items(&manager, &read_source, &connection_name);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -74,6 +132,97 @@ mod tests {
         assert_eq!(
             source.drain_items("other").unwrap(),
             vec![SerialReadItem::Line(b"ignored\n".to_vec())]
+        );
+    }
+
+    #[test]
+    fn drain_read_items_records_parsed_events_on_manager() {
+        use crate::serial::manager::{
+            ConnectionManager, InMemoryConnectionManager, SerialStreamEvent,
+        };
+
+        let manager = InMemoryConnectionManager::default();
+        let source = MockSerialReadSource::default();
+
+        source.push_line("default", b"{\"reqId\":\"1\",\"ok\":true}\r\n".to_vec());
+        source.push_line("default", b"hello robot\n".to_vec());
+        source.push_line(
+            "default",
+            b"{\"method\":\"log\",\"data\":{\"level\":\"info\"}}\n".to_vec(),
+        );
+        source.push_line(
+            "default",
+            b"{\"method\":\"notification\",\"data\":[]}\n".to_vec(),
+        );
+
+        let processed = drain_serial_read_items(&manager, &source, "default").unwrap();
+
+        assert_eq!(processed, 4);
+        assert_eq!(
+            manager.events().unwrap(),
+            vec![
+                SerialStreamEvent {
+                    event: "serial.json",
+                    data: serde_json::json!({"reqId":"1","ok":true}),
+                },
+                SerialStreamEvent {
+                    event: "serial.text",
+                    data: serde_json::json!("hello robot"),
+                },
+                SerialStreamEvent {
+                    event: "serial.log",
+                    data: serde_json::json!({"method":"log","data":{"level":"info"}}),
+                },
+                SerialStreamEvent {
+                    event: "serial.notification",
+                    data: serde_json::json!({"method":"notification","data":[]}),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_read_items_records_errors_as_serial_error_events() {
+        use crate::serial::manager::{
+            ConnectionManager, InMemoryConnectionManager, SerialStreamEvent,
+        };
+
+        let manager = InMemoryConnectionManager::default();
+        let source = MockSerialReadSource::default();
+
+        source.push_error("default", "serial read failed");
+
+        let processed = drain_serial_read_items(&manager, &source, "default").unwrap();
+
+        assert_eq!(processed, 1);
+        assert_eq!(
+            manager.events().unwrap(),
+            vec![SerialStreamEvent {
+                event: "serial.error",
+                data: serde_json::json!("serial read failed"),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn spawned_mock_read_loop_drains_items_into_manager_events() {
+        use crate::serial::manager::{
+            ConnectionManager, InMemoryConnectionManager, SerialStreamEvent,
+        };
+
+        let manager = InMemoryConnectionManager::default();
+        let source = MockSerialReadSource::default();
+        source.push_line("default", b"hello robot\n".to_vec());
+
+        let handle = spawn_mock_read_loop(manager.clone(), source, "default".to_string());
+        handle.await.unwrap();
+
+        assert_eq!(
+            manager.events().unwrap(),
+            vec![SerialStreamEvent {
+                event: "serial.text",
+                data: serde_json::json!("hello robot"),
+            }]
         );
     }
 }

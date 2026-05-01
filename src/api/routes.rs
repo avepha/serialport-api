@@ -582,6 +582,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_route_streams_read_loop_recorded_events_as_sse() {
+        let manager = InMemoryConnectionManager::default();
+        let source = crate::serial::read_loop::MockSerialReadSource::default();
+
+        source.push_line("default", b"{\"reqId\":\"1\",\"ok\":true}\r\n".to_vec());
+        source.push_line("default", b"hello robot\n".to_vec());
+        crate::serial::read_loop::drain_serial_read_items(&manager, &source, "default").unwrap();
+
+        let response = router_with_state(AppState {
+            port_lister: MockPortLister { ports: Vec::new() },
+            connection_manager: manager,
+        })
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+
+        assert!(body.contains("event: serial.json"));
+        assert!(body.contains("data: {\"ok\":true,\"reqId\":\"1\"}"));
+        assert!(body.contains("event: serial.text"));
+        assert!(body.contains("data: \"hello robot\""));
+    }
+
+    #[tokio::test]
     async fn legacy_alias_routes_share_connection_state() {
         let app = router_with_state(AppState {
             port_lister: MockPortLister {
